@@ -23,32 +23,32 @@ Never built an Open Brain? Start here:
 
 ## Recent Contributions
 
-The 20 most recent merged PRs. This list is generated from GitHub and refreshes daily. Last updated: 2026-05-22.
+The 20 most recent merged PRs. This list is generated from GitHub and refreshes daily. Last updated: 2026-06-07.
 
 <!-- recent-contributions:start -->
 
 | Contribution | What changed | Creator |
 | ------------ | ------------ | ------- |
-| [Provenance chains — derivation tracking](recipes/provenance-chains/) | Provenance chains — derivation tracking. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Open Brain Dashboard Pro — Next.js 16 + iron-session](dashboards/open-brain-dashboard-pro/) | Open Brain Dashboard Pro — Next.js 16 + iron-session. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Atomizer — generic + Gmail re-atomization toolkit](recipes/atomizer/) | Atomizer — generic + Gmail re-atomization toolkit. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Brain smoke test — install verification harness](recipes/brain-smoke-test/) | Brain smoke test — install verification harness. | [@alanshurafa](https://github.com/alanshurafa) |
-| [CRM improvements: crm_ prefix, FTS search, meeting prep, stale detection](extensions/professional-crm/) | CRM improvements: crm_ prefix, FTS search, meeting prep, stale detection. | [@pintomatic](https://github.com/pintomatic) |
-| [Edge function cost optimization — 73% invocation reduction](recipes/edge-function-cost-optimization/) | Edge function cost optimization — 73% invocation reduction. | [@JustinTSmith](https://github.com/JustinTSmith) |
-| [Obsidian-vault-import: --source-label to override metadata.source](recipes/obsidian-vault-import/) | Obsidian-vault-import: --source-label to override metadata.source. | [@dhanjit](https://github.com/dhanjit) |
-| [Preserve full frontmatter in obsidian-vault-import metadata](recipes/obsidian-vault-import/) | Preserves full frontmatter in obsidian-vault-import metadata. | [@dhanjit](https://github.com/dhanjit) |
-| [Load .env into wiki-compiler child processes](recipes/wiki-compiler/) | Loads .env into wiki-compiler child processes. | [@mlava](https://github.com/mlava) |
-| [Enable standalone output for Docker builds](dashboards/open-brain-dashboard-next/) | Enables standalone output for Docker builds. | [@Mavrick-F](https://github.com/Mavrick-F) |
-| [Fix outdated primitives section in README](README.md) | Fixes outdated primitives section in README. | [@jjshanks](https://github.com/jjshanks) |
-| [Document Edge Function redeploy step in OpenRouter rotation FAQ](docs/03-faq.md) | Documents Edge Function redeploy step in OpenRouter rotation FAQ. | [@Silverhawk-bit](https://github.com/Silverhawk-bit) |
-| [Return JSON-RPC error envelopes on auth failure](server/index.ts) | Returns JSON-RPC error envelopes on auth failure. | [@txcfi-scott](https://github.com/txcfi-scott) |
-| [Markdownlint sweep for existing recipe/schema docs](schemas/workflow-status/) | Markdownlint sweep for existing recipe/schema docs. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Improve ChatGPT MCP compatibility](primitives/remote-mcp/) | Improves ChatGPT MCP compatibility. | [@justfinethanku](https://github.com/justfinethanku) |
-| [Add wiki compiler orchestration recipe](recipes/wiki-compiler/) | Adds wiki compiler orchestration recipe. | [@justfinethanku](https://github.com/justfinethanku) |
-| [Wiki synthesis + autobiography pipeline](recipes/wiki-synthesis/) | Wiki synthesis + autobiography pipeline. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Entity wiki pages from knowledge graph](recipes/entity-wiki/) | Entity wiki pages from knowledge graph. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Typed reasoning edges + Opus/Haiku classifier](schemas/typed-reasoning-edges/) | Typed reasoning edges + Opus/Haiku classifier. | [@alanshurafa](https://github.com/alanshurafa) |
-| [Entity extraction worker](integrations/entity-extraction-worker/) | Entity extraction worker. | [@alanshurafa](https://github.com/alanshurafa) |
+| [Canonical landing page for openbrain.fyi](dashboards/ob1-canonical-landing/) | Canonical landing page for openbrain.fyi. | [@snapsynapse](https://github.com/snapsynapse) |
+| [Add local-brain-no-mcp recipe + ob1-local-http skill](recipes/local-brain-no-mcp/) | Adds local-brain-no-mcp recipe + ob1-local-http skill. | [@dhanjit](https://github.com/dhanjit) |
+| [Fix(openclaw-agent-memory): wire memory-host hooks for auto-recall (#279)](integrations/openclaw-agent-memory/) | Fix(openclaw-agent-memory): wire memory-host hooks for auto-recall (#279). | [@MicScalise](https://github.com/MicScalise) |
+| [Add OpenClaw Agent Memory tool schemas](integrations/openclaw-agent-memory/) | Adds OpenClaw Agent Memory tool schemas. | [@Humestone](https://github.com/Humestone) |
+| [Refresh OB1 PR gate workflow registration](.github/workflows/ob1-gate-v2.yml) | Refresh OB1 PR gate workflow registration. | [@Humestone](https://github.com/Humestone) |
+| [Open-brain-dashboard-next: bump next to 16.2.4](dashboards/open-brain-dashboard-next/) | Open-brain-dashboard-next: bump next to 16.2.4. | [@tswicegood](https://github.com/tswicegood) |
+| [Add Telegram capture bot](integrations/telegram-capture/) | Adds Telegram capture bot. | [@Reb-Elle-Art](https://github.com/Reb-Elle-Art) |
+| [Make enhanced-thoughts self-contained for status columns](schemas/enhanced-thoughts/) | Make enhanced-thoughts self-contained for status columns. | [@lucifer](https://github.com/lucifer) |
+| [Add per-agent identity primitive](schemas/per-agent-identity/) | Adds per-agent identity primitive. | [@jeremylahners](https://github.com/jeremylahners) |
+| [Docs(schema-aware-routing): document OpenRouter as alternative provider](recipes/schema-aware-routing/) | Docs(schema-aware-routing): document OpenRouter as alternative provider. | [@jjshanks](https://github.com/jjshanks) |
+| [Add OpenRouter provider support](recipes/typed-edge-classifier/) | Adds OpenRouter provider support. | [@sahwan11](https://github.com/sahwan11) |
+| [Add editorial-policy + weekly auditor recipe](recipes/editorial-policy/) | Adds editorial-policy + weekly auditor recipe. | [@HansBohlmann](https://github.com/HansBohlmann) |
+| [Add Readwise highlight capture (backfill + webhook + schema)](integrations/readwise-capture/) | Adds Readwise highlight capture (backfill + webhook + schema). | [@mlava](https://github.com/mlava) |
+| [Update_thought MCP with if_unchanged_since](integrations/update-thought-mcp/) | Update_thought MCP with if_unchanged_since. | [@txcfi-scott](https://github.com/txcfi-scott) |
+| [Thought_audit table for multi-participant attribution](schemas/thought-audit/) | Thought_audit table for multi-participant attribution. | [@txcfi-scott](https://github.com/txcfi-scott) |
+| [Recency-boosted match_thoughts RPC](schemas/recency-boosted-match-thoughts/) | Recency-boosted match_thoughts RPC. | [@txcfi-scott](https://github.com/txcfi-scott) |
+| [Lint sweep — bounded brain quality audit](recipes/lint-sweep/) | Lint sweep — bounded brain quality audit. | [@alanshurafa](https://github.com/alanshurafa) |
+| [Weekly digest — importance-ranked consumption format](recipes/weekly-digest/) | Weekly digest — importance-ranked consumption format. | [@alanshurafa](https://github.com/alanshurafa) |
+| [Text search trigram index for ILIKE fallback](schemas/text-search-trgm/) | Text search trigram index for ILIKE fallback. | [@alanshurafa](https://github.com/alanshurafa) |
+| [Ob-graph: iterative BFS for find_shortest_path (bug fix)](recipes/ob-graph/) | Ob-graph: iterative BFS for find_shortest_path (bug fix). | [@alanshurafa](https://github.com/alanshurafa) |
 
 <!-- recent-contributions:end -->
 
