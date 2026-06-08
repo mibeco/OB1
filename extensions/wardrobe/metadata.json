@@ -1,0 +1,28 @@
+{
+  "name": "Wardrobe System",
+  "description": "A structured wardrobe inventory and wear log: track garments, log outfits-of-the-day, save known-good combinations, and surface dormant and over-worn items for rotation reviews.",
+  "category": "extensions",
+  "author": {
+    "name": "Nate B. Jones",
+    "github": "NateBJones"
+  },
+  "contributors": [
+    {
+      "name": "Michael",
+      "github": "mibeco",
+      "contribution": "Original wardrobe-system spec, wd_ prefix convention, audience-aware wear log, dormancy/over-worn rotation report, outfit library"
+    }
+  ],
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": [],
+    "tools": ["Supabase CLI"]
+  },
+  "requires_primitives": ["deploy-edge-function", "remote-mcp"],
+  "tags": ["wardrobe", "inventory", "wear-log", "rotation", "outfits", "style"],
+  "difficulty": "intermediate",
+  "estimated_time": "45 minutes",
+  "created": "2026-06-07",
+  "updated": "2026-06-07"
+}
