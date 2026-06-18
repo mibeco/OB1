@@ -34,6 +34,17 @@ function isUuid(s: string): boolean {
   return UUID_RE.test(s.trim());
 }
 
+/**
+ * Today's date as YYYY-MM-DD in America/Los_Angeles. Used for wear-log
+ * defaults so a wearing logged late in the evening doesn't roll into
+ * "tomorrow" under UTC. en-CA formats as an ISO-style YYYY-MM-DD.
+ */
+function todayLA(): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+  }).format(new Date());
+}
+
 function ok(payload: unknown) {
   return {
     content: [
@@ -289,7 +300,9 @@ function buildServer(supabase: SupabaseClient): McpServer {
       }
 
       const eventRow: Record<string, unknown> = {};
-      if (worn_on) eventRow.worn_on = worn_on;
+      // Default to today in America/Los_Angeles rather than letting the column
+      // default (current_date) resolve in the database's UTC timezone.
+      eventRow.worn_on = worn_on || todayLA();
       if (context) eventRow.context = context;
       if (audience) eventRow.audience = audience;
       if (weather) eventRow.weather = weather;
@@ -322,6 +335,180 @@ function buildServer(supabase: SupabaseClient): McpServer {
         message: `Logged wear on ${event.worn_on} (${resolved.length} item${resolved.length === 1 ? "" : "s"}).`,
         wear_event: event,
         items: resolved.map((r) => ({ id: r.item.id, name: r.item.name })),
+      });
+    },
+  );
+
+  server.tool(
+    "wd_update_wear",
+    "Edit an existing wear event identified by `event_id`. Partial update — only the fields you supply change. If `item_refs` is provided it REPLACES the set of items linked to the event; every ref must resolve first (same all-or-nothing rule as wd_log_wear) or nothing is changed. `worn_on` is stored as a literal date (no timezone conversion). Returns the updated event with its items.",
+    {
+      event_id: z.string().describe("UUID of the wear event to edit"),
+      worn_on: z.string().optional().describe("YYYY-MM-DD, stored literally (no timezone conversion)"),
+      context: z.string().optional().describe("office, errands, dinner out, offsite, ..."),
+      weather: z.string().optional(),
+      audience: z.array(z.string()).optional().describe('People/groups who would notice repeats, e.g. ["team", "Webb"]'),
+      rating: z.number().int().min(1).max(5).optional().describe("How the outfit felt, 1-5"),
+      notes: z.string().optional(),
+      item_refs: z.array(z.string()).min(1).optional().describe("If provided, REPLACES the linked items. UUIDs or name substrings; every ref must resolve unambiguously."),
+    },
+    async ({ event_id, worn_on, context, weather, audience, rating, notes, item_refs }) => {
+      if (!isUuid(event_id)) {
+        return ok({ success: false, message: `"${event_id}" is not a valid event_id (UUID expected).` });
+      }
+
+      // Confirm the event exists before touching anything.
+      const { data: existing, error: readErr } = await supabase
+        .from("wear_events")
+        .select("*")
+        .eq("id", event_id)
+        .maybeSingle();
+      if (readErr) throw new Error(`Failed to read wear event: ${readErr.message}`);
+      if (!existing) {
+        return ok({ success: false, message: `No wear event found with id "${event_id}".` });
+      }
+
+      // If replacing items, resolve every ref first — all-or-nothing, same as wd_log_wear.
+      let resolvedItems:
+        | Extract<ResolveResult, { status: "ok" }>[]
+        | null = null;
+      if (item_refs) {
+        const { resolved, problems } = await resolveItemRefs(supabase, item_refs);
+        if (problems.length > 0) {
+          return ok({
+            success: false,
+            message: "Some item references could not be resolved — nothing was changed. Resolve these and retry.",
+            unresolved: problemsPayload(problems),
+            resolved: resolved.map((r) => ({ ref: r.ref, id: r.item.id, name: r.item.name })),
+          });
+        }
+        resolvedItems = resolved;
+      }
+
+      // Build the partial scalar update.
+      const updates: Record<string, unknown> = {};
+      if (worn_on !== undefined) updates.worn_on = worn_on;
+      if (context !== undefined) updates.context = context;
+      if (weather !== undefined) updates.weather = weather;
+      if (audience !== undefined) updates.audience = audience;
+      if (rating !== undefined) updates.rating = rating;
+      if (notes !== undefined) updates.notes = notes;
+
+      if (Object.keys(updates).length === 0 && resolvedItems === null) {
+        throw new Error("No fields or item_refs provided to update.");
+      }
+
+      let event = existing;
+      if (Object.keys(updates).length > 0) {
+        const { data, error } = await supabase
+          .from("wear_events")
+          .update(updates)
+          .eq("id", event_id)
+          .select("*")
+          .single();
+        if (error) throw new Error(`Failed to update wear event: ${error.message}`);
+        event = data;
+      }
+
+      // Replace linked items if item_refs was provided. Capture the prior link
+      // set first so we can restore it if the re-insert fails — mirrors the
+      // compensating-rollback approach in wd_log_wear.
+      if (resolvedItems) {
+        const { data: oldLinks, error: oldErr } = await supabase
+          .from("wear_event_items")
+          .select("item_id")
+          .eq("wear_event_id", event_id);
+        if (oldErr) throw new Error(`Failed to read existing item links: ${oldErr.message}`);
+
+        const { error: delErr } = await supabase
+          .from("wear_event_items")
+          .delete()
+          .eq("wear_event_id", event_id);
+        if (delErr) throw new Error(`Failed to clear existing item links: ${delErr.message}`);
+
+        const links = resolvedItems.map((r) => ({
+          wear_event_id: event_id,
+          item_id: r.item.id,
+        }));
+        const { error: insErr } = await supabase
+          .from("wear_event_items")
+          .insert(links);
+        if (insErr) {
+          // Restore the prior links so we never leave the event item-less.
+          if (oldLinks && oldLinks.length > 0) {
+            await supabase.from("wear_event_items").insert(
+              oldLinks.map((l) => ({ wear_event_id: event_id, item_id: l.item_id })),
+            );
+          }
+          throw new Error(`Failed to set new item links: ${insErr.message}`);
+        }
+      }
+
+      // Return the event with its current items.
+      const { data: links, error: linkErr } = await supabase
+        .from("wear_event_items")
+        .select("items(id, name, category)")
+        .eq("wear_event_id", event_id);
+      if (linkErr) throw new Error(`Failed to load worn items: ${linkErr.message}`);
+      const items = (links || []).map((l) => l.items);
+
+      return ok({
+        success: true,
+        message: `Updated wear event on ${event.worn_on} (${items.length} item${items.length === 1 ? "" : "s"}).`,
+        wear_event: event,
+        items,
+      });
+    },
+  );
+
+  server.tool(
+    "wd_delete_wear",
+    "Delete a wear event and all of its item links, identified by `event_id`. Returns the deleted event id, its worn_on date, and the number of item links removed.",
+    {
+      event_id: z.string().describe("UUID of the wear event to delete"),
+    },
+    async ({ event_id }) => {
+      if (!isUuid(event_id)) {
+        return ok({ success: false, message: `"${event_id}" is not a valid event_id (UUID expected).` });
+      }
+
+      const { data: existing, error: readErr } = await supabase
+        .from("wear_events")
+        .select("id, worn_on")
+        .eq("id", event_id)
+        .maybeSingle();
+      if (readErr) throw new Error(`Failed to read wear event: ${readErr.message}`);
+      if (!existing) {
+        return ok({ success: false, message: `No wear event found with id "${event_id}".` });
+      }
+
+      // Count the item links before removing them, so we can report the count.
+      const { count, error: countErr } = await supabase
+        .from("wear_event_items")
+        .select("*", { count: "exact", head: true })
+        .eq("wear_event_id", event_id);
+      if (countErr) throw new Error(`Failed to count item links: ${countErr.message}`);
+      const removed = count ?? 0;
+
+      // Delete the links first, then the event itself.
+      const { error: delLinksErr } = await supabase
+        .from("wear_event_items")
+        .delete()
+        .eq("wear_event_id", event_id);
+      if (delLinksErr) throw new Error(`Failed to delete item links: ${delLinksErr.message}`);
+
+      const { error: delEventErr } = await supabase
+        .from("wear_events")
+        .delete()
+        .eq("id", event_id);
+      if (delEventErr) throw new Error(`Failed to delete wear event: ${delEventErr.message}`);
+
+      return ok({
+        success: true,
+        message: `Deleted wear event on ${existing.worn_on} and ${removed} item link${removed === 1 ? "" : "s"}.`,
+        deleted_event_id: existing.id,
+        worn_on: existing.worn_on,
+        item_links_removed: removed,
       });
     },
   );
