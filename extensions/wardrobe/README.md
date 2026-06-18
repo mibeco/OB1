@@ -101,17 +101,19 @@ All tools use the `wd_` prefix and return JSON. Item references accept either `i
 1. **`wd_add_item`** — Add a garment/accessory. Required: `name`, `category`. Everything else optional. Use `status: "incoming"` for ordered-not-arrived.
 2. **`wd_update_item`** — Partial update by id or unambiguous name. Fit notes, condition, pairing notes, status changes.
 3. **`wd_retire_item`** — Convenience: sets `status: "retired"`, records `retired_on`, appends a reason to notes.
-4. **`wd_log_wear`** — Log an outfit-of-the-day: one wear event + links to every item worn. Resolves **all** refs before writing; on any unresolved ref it logs nothing and returns the problems.
-5. **`wd_save_outfit`** — Persist a named, reusable combination with register and notes.
-6. **`wd_mark_review_done`** — Sets `last_rotation_review` to today. Call at the end of a rotation review.
+4. **`wd_log_wear`** — Log an outfit-of-the-day: one wear event + links to every item worn. Resolves **all** refs before writing; on any unresolved ref it logs nothing and returns the problems. `worn_on` defaults to today in America/Los_Angeles.
+5. **`wd_update_wear`** — Partial edit of a wear event by `event_id`: `worn_on`, `context`, `weather`, `audience`, `rating`, `notes`. Optionally pass `item_refs` to **replace** the linked items (resolved all-or-nothing, same as `wd_log_wear`). `worn_on` is stored as a literal date.
+6. **`wd_delete_wear`** — Delete a wear event and its item links by `event_id`. Returns the deleted id, `worn_on`, and the number of item links removed.
+7. **`wd_save_outfit`** — Persist a named, reusable combination with register and notes.
+8. **`wd_mark_review_done`** — Sets `last_rotation_review` to today. Call at the end of a rotation review.
 
 **Reads**
 
-7. **`wd_get_inventory`** — List items with filters: `category`, `register`, `status`, `color_family`, `season`, `weight`. Excludes retired unless asked.
-8. **`wd_get_item`** — Full record for one item plus its wear stats (total/last/30d/90d).
-9. **`wd_wear_history`** — Wear events filtered by date range, item, context, or audience tag. Answers "when did I last wear X around Y."
-10. **`wd_rotation_report`** — Dormant (unworn ≥ N days, default 60), over-worn (≥ M wears in 30 days, default 6), and `under_review` items, plus `last_rotation_review` and `days_since_review`. N and M overridable.
-11. **`wd_get_outfits`** — Saved outfits, optionally filtered by register or by containing item.
+9. **`wd_get_inventory`** — List items with filters: `category`, `register`, `status`, `color_family`, `season`, `weight`. Excludes retired unless asked.
+10. **`wd_get_item`** — Full record for one item plus its wear stats (total/last/30d/90d).
+11. **`wd_wear_history`** — Wear events filtered by date range, item, context, or audience tag. Answers "when did I last wear X around Y."
+12. **`wd_rotation_report`** — Dormant (unworn ≥ N days, default 60), over-worn (≥ M wears in 30 days, default 6), and `under_review` items, plus `last_rotation_review` and `days_since_review`. N and M overridable.
+13. **`wd_get_outfits`** — Saved outfits, optionally filtered by register or by containing item.
 
 > **Note on qualitative notes.** There is intentionally no `wd_get_style_notes` tool and no `style_notes` table. Style identity, registers, principles, and person notes live in the base Open Brain `thoughts` store — capture them with `capture_thought` and retrieve them with `search_thoughts`. This keeps the structured wardrobe data and the qualitative wiki cleanly separated, and makes your style profile available to every connected AI, not just this extension.
 
