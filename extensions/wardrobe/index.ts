@@ -12,6 +12,14 @@
  * capture_thought / search_thoughts — NOT here. This server never touches the
  * thoughts table.
  *
+ * Every formulated outfit (a recommendation option, a saved outfit, a wear
+ * event) carries two free-text tags: `register_note` (the owner's personal
+ * composite, which bundles lineage with a formality band) and `paradigm_note`
+ * (Simon Crompton's lineage-only taxonomy — British country, American prep,
+ * Italian smooth, Workwear, Sportswear). They are prose, not enums, so mixing,
+ * ambiguity and deliberate collisions can be described rather than forced into
+ * one bucket. The definitions live in the thoughts store; see migration 003.
+ *
  * Conventions mirror extensions/professional-crm (tool registration, JSON
  * responses, error handling) and the base open-brain-mcp server (JSON-RPC
  * auth envelope, CORS, Accept-header patch). Tools use the `wd_` prefix.
@@ -55,6 +63,73 @@ function ok(payload: unknown) {
 
 const ITEM_COLUMNS =
   "id, name, category, subcategory, brand, color, color_family, fabric, weight, seasons, register, formality, size, fit_notes, condition, status, acquired_on, acquired_from, price_paid, retired_on, pairing_notes, notes, created_at, updated_at";
+
+const STATS_COLUMNS =
+  "id, total_wears, last_worn, days_since_worn, wears_30d, wears_90d, total_recommendations, last_recommended_for, days_since_recommended";
+
+/**
+ * Per-item wear and recommendation stats, as served by the `v_item_stats`
+ * view. Counts are always numbers — never null. Dates and the day-counts
+ * derived from them stay nullable, because "never worn" genuinely has no date
+ * and 0 would be a lie there.
+ */
+type ItemStats = {
+  total_wears: number;
+  last_worn: string | null;
+  days_since_worn: number | null;
+  wears_30d: number;
+  wears_90d: number;
+  total_recommendations: number;
+  last_recommended_for: string | null;
+  days_since_recommended: number | null;
+};
+
+/**
+ * Coerce a `v_item_stats` row into `ItemStats`, zero-filling the counts.
+ *
+ * The view already coalesces, so this is the second belt: a null count that
+ * reached a caller would read as "unknown" and invite inference from
+ * `condition` or `acquired_on` — the exact failure these fields exist to
+ * close. An explicit 0 is a claim the database is making.
+ */
+function normalizeStats(row: Partial<ItemStats> | null | undefined): ItemStats {
+  return {
+    total_wears: row?.total_wears ?? 0,
+    last_worn: row?.last_worn ?? null,
+    days_since_worn: row?.days_since_worn ?? null,
+    wears_30d: row?.wears_30d ?? 0,
+    wears_90d: row?.wears_90d ?? 0,
+    total_recommendations: row?.total_recommendations ?? 0,
+    last_recommended_for: row?.last_recommended_for ?? null,
+    days_since_recommended: row?.days_since_recommended ?? null,
+  };
+}
+
+/**
+ * Load stats for the whole catalogue in one grouped query, keyed by item id.
+ * Never call this per item inside a loop — that is what it exists to avoid.
+ *
+ * It reads the view unfiltered rather than restricting to the page of items
+ * being returned. Two reasons: some `wd_get_inventory` filters (season,
+ * color_family, weight) don't exist on the stats view, so restating them here
+ * would put the same filter logic in two places and let it drift; and a
+ * 250-uuid `in(...)` list pushes the PostgREST request line toward the proxy's
+ * header limit. The catalogue is one person's wardrobe — a few hundred narrow
+ * rows — so reading all of it is cheaper than either alternative.
+ */
+async function fetchStatsMap(
+  supabase: SupabaseClient,
+): Promise<Map<string, ItemStats>> {
+  const { data, error } = await supabase
+    .from("v_item_stats")
+    .select(STATS_COLUMNS)
+    .range(0, 9999);
+  if (error) throw new Error(`Failed to load item stats: ${error.message}`);
+
+  const map = new Map<string, ItemStats>();
+  for (const row of data || []) map.set(row.id, normalizeStats(row));
+  return map;
+}
 
 type ItemRow = { id: string; name: string; category: string; status: string };
 
@@ -140,6 +215,462 @@ function problemsPayload(
       }
       : { ref: p.ref, problem: "no_match" }
   );
+}
+
+// --- Rotation eligibility ------------------------------------------------
+//
+// The 7-day recency rule for shirts, tees and socks, computed in ONE place.
+// `computeEligibility` is the single implementation: `wd_eligibility` returns
+// its result verbatim, and `wd_log_recommendation` re-runs it at write time
+// and refuses to write any option that contains a blocked item. The assistant
+// reads buckets from this result; it never derives them.
+//
+// The rule, in its own words. From the style profile:
+//   "7-day recency (shirts, socks, tees only): never recommend the same shirt,
+//    sock, or tee within a rolling 7 days — check both the wear log and any
+//    locked/planned capsule. Pants, outerwear, and shoes are exempt."
+// From the standing corrections:
+//   "Recommended-but-unworn suppresses re-proposing the same configuration,
+//    not the item; never applies to items carrying an under-rotation flag."
+//   "`total_wears: 0` means no logged wear since cataloguing, not never worn."
+// Nothing beyond those clauses is encoded here.
+
+const ELIGIBILITY_WINDOW_DAYS = 7;
+const ELIGIBILITY_DEFAULT_DORMANCY_DAYS = 30;
+const ELIGIBILITY_RUN_VERSION = 1;
+
+/**
+ * Minutes a `wd_eligibility` run stays fresh enough to authorise a write.
+ * Overridable via env only so the staleness path can be exercised in a test;
+ * production leaves it at the default.
+ */
+const ELIGIBILITY_RUN_TTL_MINUTES = Number(
+  Deno.env.get("WD_ELIGIBILITY_TTL_MINUTES") ?? 30,
+);
+
+/**
+ * HMAC key for run tokens. A dedicated function secret, deliberately NOT the
+ * service role key: the token only needs to prove "this server computed
+ * eligibility for this date at this time", and reusing a credential that can
+ * do everything for a signature that needs to do one thing is how keys leak.
+ */
+const WD_ELIGIBILITY_SECRET = Deno.env.get("WD_ELIGIBILITY_SECRET");
+
+/** Categories governed outright (when `status = 'active'`). */
+const GOVERNED_CATEGORIES = ["shirt", "tee", "socks"];
+
+/**
+ * Loopwheel / slub tees and tanks are catalogued under `knitwear` in this
+ * database, so knitwear is governed by subcategory: `subcategory ILIKE ANY
+ * ('%tee%', '%t-shirt%', '%tank%')`. Sweaters, hoodies, henleys and vests
+ * stay exempt.
+ */
+const GOVERNED_KNITWEAR_SUBCATEGORY_TERMS = ["tee", "t-shirt", "tank"];
+
+/** What `wd_eligibility` evaluates when `categories` is omitted. */
+const DEFAULT_ELIGIBILITY_CATEGORIES = [...GOVERNED_CATEGORIES, "knitwear"];
+
+/**
+ * A recommendation with one of these outcomes became a wear, and `last_worn`
+ * already covers it. Only the others count toward the configuration flag.
+ */
+const WORN_OUTCOMES = new Set(["worn_as_proposed", "worn_with_deviation"]);
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isLiteralDate(s: string): boolean {
+  return DATE_RE.test(s) && !Number.isNaN(Date.parse(s));
+}
+
+/**
+ * Whole days from `b` to `a`. Both are literal YYYY-MM-DD, so Date.parse
+ * places them at UTC midnight and the difference is exact — same trick as
+ * `wd_recommendation_history`.
+ */
+function daysBetween(a: string, b: string): number {
+  return Math.floor((Date.parse(a) - Date.parse(b)) / 86400000);
+}
+
+type EligibilityItemRow = {
+  id: string;
+  name: string;
+  category: string;
+  subcategory: string | null;
+  status: string;
+};
+
+/**
+ * The governed-set rule, exactly as stated: active, and either a shirt / tee /
+ * sock by category, or knitwear whose subcategory reads as a tee or tank.
+ */
+function isGoverned(item: EligibilityItemRow): boolean {
+  if (item.status !== "active") return false;
+  if (GOVERNED_CATEGORIES.includes(item.category)) return true;
+  if (item.category === "knitwear" && item.subcategory) {
+    const sub = item.subcategory.toLowerCase();
+    return GOVERNED_KNITWEAR_SUBCATEGORY_TERMS.some((t) => sub.includes(t));
+  }
+  return false;
+}
+
+type EligibilityBucket =
+  | "blocked_worn"
+  | "boundary"
+  | "config_flag"
+  | "eligible"
+  | "exempt";
+
+/** One (recommendation, option) an item appeared in and was not worn from. */
+type UnwornConfiguration = {
+  recommendation_id: string;
+  option_index: number;
+  label: string | null;
+  recommended_for: string;
+  days_since_recommended: number;
+  outcome: string;
+  other_items: string[];
+};
+
+type EligibilityItem = {
+  id: string;
+  name: string;
+  category: string;
+  subcategory: string | null;
+  governed: boolean;
+  bucket: EligibilityBucket;
+  reason: string;
+  total_wears: number;
+  last_worn: string | null;
+  days_since_worn: number | null;
+  last_recommended_for: string | null;
+  days_since_recommended: number | null;
+  last_recommendation_id: string | null;
+  under_rotation: boolean;
+  never_worn: boolean;
+  never_recommended: boolean;
+  unworn_configurations: UnwornConfiguration[];
+};
+
+type EligibilityResult = {
+  run_id: string;
+  computed_at: string;
+  for_date: string;
+  window_days: number;
+  dormancy_days: number;
+  governed_categories: string[];
+  governed_knitwear_subcategory_terms: string[];
+  requested_categories: string[];
+  counts: Record<EligibilityBucket, number>;
+  blocked_worn: EligibilityItem[];
+  boundary: EligibilityItem[];
+  config_flag: EligibilityItem[];
+  eligible: EligibilityItem[];
+  exempt: EligibilityItem[];
+  never_worn: string[];
+  never_recommended: string[];
+};
+
+/** Shape of the nested PostgREST read in `computeEligibility`. */
+type RecommendationTreeRow = {
+  id: string;
+  recommended_for: string;
+  outcome: string;
+  created_at: string;
+  recommendation_options: {
+    id: string;
+    option_index: number;
+    label: string | null;
+    recommendation_option_items: {
+      item_id: string;
+      items: { id: string; name: string } | null;
+    }[];
+  }[];
+};
+
+type RecEntry = Omit<UnwornConfiguration, "days_since_recommended"> & {
+  created_at: string;
+};
+
+const byName = <T extends { name: string }>(a: T, b: T) =>
+  a.name.localeCompare(b.name);
+
+/**
+ * Compute rotation eligibility for every active item in `categories`, as of
+ * `forDate` (the date the outfit is FOR — literal, no timezone conversion).
+ *
+ * Reads: the items, the same `v_item_stats` map the inventory tools use (so
+ * `total_wears` / `last_worn` agree with `wd_get_inventory` by construction),
+ * and the full recommendation tree (recommendations → options → items) so a
+ * flagged configuration can name the other items in that option. Three round
+ * trips regardless of wardrobe size.
+ *
+ * Bucketing is evaluated in order, first match wins:
+ *   1. blocked_worn — governed, worn 0..6 days before forDate
+ *   2. boundary     — governed, worn exactly 7 days before forDate
+ *   3. config_flag  — governed, an unworn recommendation 0..6 days before
+ *                     forDate, and NOT under rotation
+ *   4. eligible     — everything else governed
+ *   5. exempt       — not governed
+ * `under_rotation` (no logged wear, or unworn >= dormancyDays) is independent
+ * of bucket, and an under-rotation item never lands in config_flag: its
+ * recommendation history is attached as information instead.
+ */
+async function computeEligibility(
+  supabase: SupabaseClient,
+  forDate: string,
+  categories: string[] = DEFAULT_ELIGIBILITY_CATEGORIES,
+  dormancyDays: number = ELIGIBILITY_DEFAULT_DORMANCY_DAYS,
+): Promise<EligibilityResult> {
+  const computedAt = new Date().toISOString();
+
+  const [itemsRes, statsMap, recsRes] = await Promise.all([
+    supabase
+      .from("items")
+      .select("id, name, category, subcategory, status")
+      .eq("status", "active")
+      .in("category", categories)
+      .range(0, 9999),
+    fetchStatsMap(supabase),
+    supabase
+      .from("recommendations")
+      .select(
+        // `!recommendation_id` disambiguates: recommendations ↔ options are linked
+        // twice (option.recommendation_id and recommendations.chosen_option_id).
+        "id, recommended_for, outcome, created_at, recommendation_options!recommendation_id(id, option_index, label, recommendation_option_items(item_id, items(id, name)))",
+      )
+      .range(0, 9999),
+  ]);
+  if (itemsRes.error) {
+    throw new Error(`Failed to load items for eligibility: ${itemsRes.error.message}`);
+  }
+  if (recsRes.error) {
+    throw new Error(`Failed to load recommendations for eligibility: ${recsRes.error.message}`);
+  }
+
+  // Index every (recommendation, option) each item appeared in, carrying the
+  // other item names from that option.
+  const recsByItem = new Map<string, RecEntry[]>();
+  for (const rec of (recsRes.data || []) as unknown as RecommendationTreeRow[]) {
+    for (const opt of rec.recommendation_options || []) {
+      const members = (opt.recommendation_option_items || []).map((l) => ({
+        id: l.item_id,
+        name: l.items?.name ?? l.item_id,
+      }));
+      for (const m of members) {
+        const arr = recsByItem.get(m.id) || [];
+        arr.push({
+          recommendation_id: rec.id,
+          option_index: opt.option_index,
+          label: opt.label ?? null,
+          recommended_for: rec.recommended_for,
+          outcome: rec.outcome,
+          created_at: rec.created_at,
+          other_items: members
+            .filter((x) => x.id !== m.id)
+            .map((x) => x.name)
+            .sort((a, b) => a.localeCompare(b)),
+        });
+        recsByItem.set(m.id, arr);
+      }
+    }
+  }
+  const newestFirst = (a: RecEntry, b: RecEntry) =>
+    b.recommended_for.localeCompare(a.recommended_for) ||
+    b.created_at.localeCompare(a.created_at) ||
+    a.option_index - b.option_index;
+
+  const items: EligibilityItem[] = [];
+  for (const row of (itemsRes.data || []) as EligibilityItemRow[]) {
+    const stats = normalizeStats(statsMap.get(row.id));
+    const governed = isGoverned(row);
+    const entries = (recsByItem.get(row.id) || []).sort(newestFirst);
+    const latest = entries[0] ?? null;
+
+    const dWorn = stats.last_worn ? daysBetween(forDate, stats.last_worn) : null;
+    const dRec = latest ? daysBetween(forDate, latest.recommended_for) : null;
+    const neverWorn = stats.total_wears === 0;
+    const neverRecommended = entries.length === 0;
+    const underRotation = neverWorn || (dWorn !== null && dWorn >= dormancyDays);
+
+    // Unworn recommendations inside the window, newest first.
+    const unworn: UnwornConfiguration[] = entries
+      .filter((e) => !WORN_OUTCOMES.has(e.outcome))
+      .map(({ created_at: _c, ...e }) => ({
+        ...e,
+        days_since_recommended: daysBetween(forDate, e.recommended_for),
+      }))
+      .filter((e) =>
+        e.days_since_recommended >= 0 &&
+        e.days_since_recommended < ELIGIBILITY_WINDOW_DAYS
+      );
+
+    const days = (n: number) => `${n} day${n === 1 ? "" : "s"}`;
+    const configText = (c: UnwornConfiguration) =>
+      `recommended ${c.recommended_for} for rec ${c.recommendation_id} option ${c.option_index} (unworn)` +
+      (c.other_items.length > 0 ? ` [with: ${c.other_items.join(", ")}]` : "");
+
+    let bucket: EligibilityBucket;
+    let reason: string;
+    if (!governed) {
+      bucket = "exempt";
+      reason = `not governed: ${row.category}${row.subcategory ? ` / ${row.subcategory}` : ""}`;
+    } else if (dWorn !== null && dWorn >= 0 && dWorn < ELIGIBILITY_WINDOW_DAYS) {
+      bucket = "blocked_worn";
+      reason = `worn ${stats.last_worn} (${days(dWorn)})`;
+    } else if (dWorn === ELIGIBILITY_WINDOW_DAYS) {
+      bucket = "boundary";
+      reason = `worn ${stats.last_worn} (7 days, boundary)`;
+    } else if (unworn.length > 0 && !underRotation) {
+      bucket = "config_flag";
+      reason = `${configText(unworn[0])} — do not re-propose that configuration; item is eligible`;
+    } else {
+      bucket = "eligible";
+      const parts: string[] = [];
+      if (neverWorn) {
+        parts.push("no logged wear (total_wears 0)");
+      } else if (dWorn !== null && dWorn < 0) {
+        parts.push(`worn ${stats.last_worn} (${days(-dWorn)} after for_date)`);
+      } else {
+        parts.push(`worn ${stats.last_worn} (${days(dWorn as number)})`);
+      }
+      if (underRotation) parts.push(`under rotation (threshold ${days(dormancyDays)})`);
+      if (unworn.length > 0) {
+        parts.push(`${configText(unworn[0])} — under rotation, so this is information, not a flag`);
+      }
+      reason = parts.join("; ");
+    }
+
+    items.push({
+      id: row.id,
+      name: row.name,
+      category: row.category,
+      subcategory: row.subcategory,
+      governed,
+      bucket,
+      reason,
+      total_wears: stats.total_wears,
+      last_worn: stats.last_worn,
+      days_since_worn: dWorn,
+      last_recommended_for: latest?.recommended_for ?? null,
+      days_since_recommended: dRec,
+      last_recommendation_id: latest?.recommendation_id ?? null,
+      under_rotation: underRotation,
+      never_worn: neverWorn,
+      never_recommended: neverRecommended,
+      unworn_configurations: unworn,
+    });
+  }
+  items.sort(byName);
+
+  const pick = (b: EligibilityBucket) => items.filter((i) => i.bucket === b);
+  const buckets = {
+    blocked_worn: pick("blocked_worn"),
+    boundary: pick("boundary"),
+    config_flag: pick("config_flag"),
+    eligible: pick("eligible"),
+    exempt: pick("exempt"),
+  };
+  const governedItems = items.filter((i) => i.governed);
+
+  const run_id = await signEligibilityRun({
+    for_date: forDate,
+    computed_at: computedAt,
+    v: ELIGIBILITY_RUN_VERSION,
+  });
+
+  return {
+    run_id,
+    computed_at: computedAt,
+    for_date: forDate,
+    window_days: ELIGIBILITY_WINDOW_DAYS,
+    dormancy_days: dormancyDays,
+    governed_categories: GOVERNED_CATEGORIES,
+    governed_knitwear_subcategory_terms: GOVERNED_KNITWEAR_SUBCATEGORY_TERMS,
+    requested_categories: categories,
+    counts: {
+      blocked_worn: buckets.blocked_worn.length,
+      boundary: buckets.boundary.length,
+      config_flag: buckets.config_flag.length,
+      eligible: buckets.eligible.length,
+      exempt: buckets.exempt.length,
+    },
+    ...buckets,
+    never_worn: governedItems.filter((i) => i.never_worn).map((i) => i.name),
+    never_recommended: governedItems.filter((i) => i.never_recommended).map((i) => i.name),
+  };
+}
+
+// --- Eligibility run tokens ------------------------------------------------
+//
+// Stateless proof that this server computed eligibility for a date at a time:
+// `base64url(payload) + "." + base64url(HMAC-SHA256(payload, secret))` with
+// payload `{ for_date, computed_at, v }`. No table, nothing to clean up. The
+// validator in `wd_log_recommendation` checks the signature, the date, and
+// the age — then recomputes eligibility anyway, so the token authorises the
+// write without being trusted for its contents.
+
+type EligibilityRunPayload = { for_date: string; computed_at: string; v: number };
+
+function base64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64urlDecode(s: string): Uint8Array<ArrayBuffer> {
+  const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+  const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function eligibilityHmacKey(): Promise<CryptoKey> {
+  if (!WD_ELIGIBILITY_SECRET) {
+    throw new Error(
+      "WD_ELIGIBILITY_SECRET is not set. Set it with `supabase secrets set WD_ELIGIBILITY_SECRET=<random>` and redeploy wardrobe-mcp.",
+    );
+  }
+  return await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(WD_ELIGIBILITY_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"],
+  );
+}
+
+async function signEligibilityRun(payload: EligibilityRunPayload): Promise<string> {
+  const body = new TextEncoder().encode(JSON.stringify(payload));
+  const sig = await crypto.subtle.sign("HMAC", await eligibilityHmacKey(), body);
+  return `${base64url(body)}.${base64url(new Uint8Array(sig))}`;
+}
+
+/** Returns the payload when the signature holds and the shape is right; null otherwise. */
+async function verifyEligibilityRun(token: string): Promise<EligibilityRunPayload | null> {
+  const parts = token.trim().split(".");
+  if (parts.length !== 2) return null;
+  let body: Uint8Array<ArrayBuffer>;
+  let sig: Uint8Array<ArrayBuffer>;
+  try {
+    body = base64urlDecode(parts[0]);
+    sig = base64urlDecode(parts[1]);
+  } catch {
+    return null;
+  }
+  // subtle.verify is constant-time; never compare signatures with ===.
+  const valid = await crypto.subtle.verify("HMAC", await eligibilityHmacKey(), sig, body);
+  if (!valid) return null;
+  try {
+    const p = JSON.parse(new TextDecoder().decode(body));
+    if (
+      !p || typeof p !== "object" || p.v !== ELIGIBILITY_RUN_VERSION ||
+      typeof p.for_date !== "string" || typeof p.computed_at !== "string"
+    ) return null;
+    return p as EligibilityRunPayload;
+  } catch {
+    return null;
+  }
 }
 
 // --- MCP tools -----------------------------------------------------------
@@ -277,7 +808,7 @@ function buildServer(supabase: SupabaseClient): McpServer {
 
   server.tool(
     "wd_log_wear",
-    "Log an outfit-of-the-day: one wear event plus links to every item worn. Every ref in `item_refs` must resolve before anything is written — on any ambiguous or missing ref, nothing is logged and the problems are returned instead. Each ref is an item UUID or a case-insensitive name substring.",
+    "Log an outfit-of-the-day: one wear event plus links to every item worn. Every ref in `item_refs` must resolve before anything is written — on any ambiguous or missing ref, nothing is logged and the problems are returned instead. Each ref is an item UUID or a case-insensitive name substring. Always supply `register_note` and `paradigm_note`: the outfit as worn is tagged on both axes, in prose, even when it matches a proposal.",
     {
       item_refs: z.array(z.string()).min(1).describe('Items worn, e.g. ["tan chinos", "Buzz Rickson workshirt", "LMSM chore coat", "Aldens"]'),
       worn_on: z.string().optional().describe("YYYY-MM-DD, defaults to today"),
@@ -287,8 +818,10 @@ function buildServer(supabase: SupabaseClient): McpServer {
       rating: z.number().int().min(1).max(5).optional().describe("How the outfit felt, 1-5"),
       notes: z.string().optional(),
       outfit_id: z.string().optional().describe("Optional UUID of a saved outfit this wearing corresponds to"),
+      register_note: z.string().optional().describe('Free text: which register(s) the outfit sits in, with any mixing or collision noted, e.g. "heritage workwear; formality crossing at the black bluchers"'),
+      paradigm_note: z.string().optional().describe('Free text: which Crompton paradigm(s) it draws on, with overlap or ambiguity noted, e.g. "Workwear throughout; Italian smooth at the knit"'),
     },
-    async ({ item_refs, worn_on, context, audience, weather, rating, notes, outfit_id }) => {
+    async ({ item_refs, worn_on, context, audience, weather, rating, notes, outfit_id, register_note, paradigm_note }) => {
       const { resolved, problems } = await resolveItemRefs(supabase, item_refs);
       if (problems.length > 0) {
         return ok({
@@ -309,6 +842,8 @@ function buildServer(supabase: SupabaseClient): McpServer {
       if (rating !== undefined) eventRow.rating = rating;
       if (notes) eventRow.notes = notes;
       if (outfit_id) eventRow.outfit_id = outfit_id;
+      if (register_note) eventRow.register_note = register_note;
+      if (paradigm_note) eventRow.paradigm_note = paradigm_note;
 
       const { data: event, error: eventErr } = await supabase
         .from("wear_events")
@@ -350,9 +885,11 @@ function buildServer(supabase: SupabaseClient): McpServer {
       audience: z.array(z.string()).optional().describe('People/groups who would notice repeats, e.g. ["team", "Webb"]'),
       rating: z.number().int().min(1).max(5).optional().describe("How the outfit felt, 1-5"),
       notes: z.string().optional(),
+      register_note: z.string().optional().describe("Free text: which register(s) the outfit sits in, with mixing or collision noted"),
+      paradigm_note: z.string().optional().describe("Free text: which Crompton paradigm(s) it draws on, with overlap or ambiguity noted"),
       item_refs: z.array(z.string()).min(1).optional().describe("If provided, REPLACES the linked items. UUIDs or name substrings; every ref must resolve unambiguously."),
     },
-    async ({ event_id, worn_on, context, weather, audience, rating, notes, item_refs }) => {
+    async ({ event_id, worn_on, context, weather, audience, rating, notes, register_note, paradigm_note, item_refs }) => {
       if (!isUuid(event_id)) {
         return ok({ success: false, message: `"${event_id}" is not a valid event_id (UUID expected).` });
       }
@@ -393,6 +930,8 @@ function buildServer(supabase: SupabaseClient): McpServer {
       if (audience !== undefined) updates.audience = audience;
       if (rating !== undefined) updates.rating = rating;
       if (notes !== undefined) updates.notes = notes;
+      if (register_note !== undefined) updates.register_note = register_note;
+      if (paradigm_note !== undefined) updates.paradigm_note = paradigm_note;
 
       if (Object.keys(updates).length === 0 && resolvedItems === null) {
         throw new Error("No fields or item_refs provided to update.");
@@ -514,16 +1053,370 @@ function buildServer(supabase: SupabaseClient): McpServer {
   );
 
   server.tool(
+    "wd_log_recommendation",
+    "Log an outfit recommendation at the moment it is proposed — one call per proposal event, covering every option offered (a single-option proposal is an `options` array of length 1). Every item ref in every option must resolve before anything is written — on any ambiguous or missing ref, nothing is logged and the problems are returned instead. `recommended_for` is the date the outfit is FOR (stored literally, no timezone conversion); `proposed_on` is set to today in America/Los_Angeles. Outcome starts as 'pending' — close the loop later with wd_update_recommendation. Every option must carry `register_note` and `paradigm_note`: each formulated outfit is tagged on both axes, in prose, so mixing and deliberate collisions are recorded rather than flattened. Requires `eligibility_run_id` from a wd_eligibility run for the same `recommended_for`, no older than 30 minutes: eligibility is recomputed at write time and any option containing a `blocked_worn` item is refused outright (no partial write). `boundary` and `config_flag` items are written but reported back in `warnings`.",
+    {
+      recommended_for: z.string().describe("YYYY-MM-DD the outfit is for (not the date proposed); stored literally"),
+      eligibility_run_id: z.string().describe("Required. The `run_id` returned by wd_eligibility for this same recommended_for, computed within the last 30 minutes. The write is refused without it."),
+      options: z.array(z.object({
+        label: z.string().optional().describe('Short handle, e.g. "warm-earth heritage-lean"'),
+        rationale: z.string().optional().describe("The one-line reasoning given for this option"),
+        item_refs: z.array(z.string()).min(1).describe("Items in this option (UUIDs or name substrings)"),
+        register_note: z.string().optional().describe('Free text: which register(s) this option sits in, with any mixing or collision noted, e.g. "smart casual base; heritage at the jacket — single-axis collision"'),
+        paradigm_note: z.string().optional().describe('Free text: which Crompton paradigm(s) it draws on, with overlap or ambiguity noted, e.g. "Italian smooth (knit, loafers) over Workwear (denim); Sportswear accent at the sneaker"'),
+      })).min(1).describe("The options offered, in the order presented"),
+      context: z.string().optional().describe("office, errands, dinner out, offsite, ..."),
+      weather: z.string().optional(),
+      audience: z.array(z.string()).optional().describe('People/groups who would see the outfit, e.g. ["team", "Webb"]'),
+      notes: z.string().optional(),
+    },
+    async ({ recommended_for, eligibility_run_id, options, context, weather, audience, notes }) => {
+      // Gate 1–3: the run token must verify, be for this date, and be fresh.
+      // All three are checked before any read or write.
+      const run = await verifyEligibilityRun(eligibility_run_id);
+      if (!run) {
+        return ok({
+          success: false,
+          error: "eligibility_run_invalid",
+          message: "eligibility_run_id is not a valid wd_eligibility run token — nothing was logged. Call wd_eligibility for this recommended_for and pass its run_id.",
+        });
+      }
+      if (run.for_date !== recommended_for) {
+        return ok({
+          success: false,
+          error: "eligibility_run_date_mismatch",
+          message: `The eligibility run was computed for ${run.for_date}, not ${recommended_for} — nothing was logged. Call wd_eligibility for ${recommended_for} and retry.`,
+          run_for_date: run.for_date,
+          recommended_for,
+        });
+      }
+      const ageMinutes = (Date.now() - Date.parse(run.computed_at)) / 60000;
+      if (!(ageMinutes <= ELIGIBILITY_RUN_TTL_MINUTES)) {
+        return ok({
+          success: false,
+          error: "eligibility_run_stale",
+          message: `The eligibility run is ${Number.isFinite(ageMinutes) ? (Math.round(ageMinutes * 10) / 10).toString() : "?"} minutes old (limit ${ELIGIBILITY_RUN_TTL_MINUTES}) — nothing was logged. Call wd_eligibility again and retry.`,
+          computed_at: run.computed_at,
+        });
+      }
+
+      // Resolve every ref in every option before writing anything —
+      // all-or-nothing across the entire call, same rule as wd_log_wear.
+      const perOption = await Promise.all(
+        options.map((o) => resolveItemRefs(supabase, o.item_refs)),
+      );
+      const unresolved = perOption.flatMap((r, i) =>
+        problemsPayload(r.problems).map((p) => ({ option_index: i + 1, ...p }))
+      );
+      if (unresolved.length > 0) {
+        return ok({
+          success: false,
+          message: "Some item references could not be resolved — nothing was logged. Resolve these and retry.",
+          unresolved,
+        });
+      }
+
+      // Dedupe repeated refs within an option so the link-table PK holds.
+      const itemsPerOption = perOption.map((r) => {
+        const seen = new Set<string>();
+        return r.resolved.filter((x) =>
+          seen.has(x.item.id) ? false : (seen.add(x.item.id), true)
+        );
+      });
+
+      // Gate 4–5: recompute eligibility for the date at write time — the same
+      // implementation wd_eligibility exposes, not a second copy of the rule.
+      // Any blocked item in any option refuses the whole call; boundary and
+      // config_flag items go through and are surfaced as warnings.
+      const eligibility = await computeEligibility(supabase, recommended_for);
+      const eligibilityById = new Map(
+        [
+          ...eligibility.blocked_worn,
+          ...eligibility.boundary,
+          ...eligibility.config_flag,
+          ...eligibility.eligible,
+          ...eligibility.exempt,
+        ].map((e) => [e.id, e] as const),
+      );
+      const blocked: { option_index: number; item_id: string; name: string; reason: string }[] = [];
+      const warnings: { option_index: number; item_id: string; name: string; bucket: string; reason: string }[] = [];
+      itemsPerOption.forEach((resolvedItems, i) => {
+        for (const r of resolvedItems) {
+          const e = eligibilityById.get(r.item.id);
+          if (!e || !e.governed) continue; // non-governed items are never checked
+          if (e.bucket === "blocked_worn") {
+            blocked.push({ option_index: i + 1, item_id: e.id, name: e.name, reason: e.reason });
+          } else if (e.bucket === "boundary" || e.bucket === "config_flag") {
+            warnings.push({ option_index: i + 1, item_id: e.id, name: e.name, bucket: e.bucket, reason: e.reason });
+          }
+        }
+      });
+      if (blocked.length > 0) {
+        return ok({
+          success: false,
+          error: "blocked_items",
+          message: `${blocked.length} item${blocked.length === 1 ? " is" : "s are"} inside the 7-day window for ${recommended_for} — nothing was logged. Replace the blocked item${blocked.length === 1 ? "" : "s"} and retry.`,
+          blocked_items: blocked,
+          warnings,
+        });
+      }
+
+      const recRow: Record<string, unknown> = {
+        recommended_for,
+        proposed_on: todayLA(),
+        eligibility_run_id,
+      };
+      if (context) recRow.context = context;
+      if (weather) recRow.weather = weather;
+      if (audience) recRow.audience = audience;
+      if (notes) recRow.notes = notes;
+
+      const { data: rec, error: recErr } = await supabase
+        .from("recommendations")
+        .insert(recRow)
+        .select("*")
+        .single();
+      if (recErr) throw new Error(`Failed to create recommendation: ${recErr.message}`);
+
+      const optionRows = options.map((o, i) => {
+        const row: Record<string, unknown> = {
+          recommendation_id: rec.id,
+          option_index: i + 1,
+        };
+        if (o.label) row.label = o.label;
+        if (o.rationale) row.rationale = o.rationale;
+        if (o.register_note) row.register_note = o.register_note;
+        if (o.paradigm_note) row.paradigm_note = o.paradigm_note;
+        return row;
+      });
+      const { data: createdOptions, error: optErr } = await supabase
+        .from("recommendation_options")
+        .insert(optionRows)
+        .select("*");
+      if (optErr) {
+        // Roll back the orphaned recommendation (cascade removes any options).
+        await supabase.from("recommendations").delete().eq("id", rec.id);
+        throw new Error(`Failed to create recommendation options: ${optErr.message}`);
+      }
+
+      const sorted = [...(createdOptions || [])].sort(
+        (a, b) => a.option_index - b.option_index,
+      );
+      const links = sorted.flatMap((row, i) =>
+        itemsPerOption[i].map((r) => ({
+          recommendation_option_id: row.id,
+          item_id: r.item.id,
+        }))
+      );
+      const { error: linkErr } = await supabase
+        .from("recommendation_option_items")
+        .insert(links);
+      if (linkErr) {
+        // Roll back everything; cascade removes options and any partial links.
+        await supabase.from("recommendations").delete().eq("id", rec.id);
+        throw new Error(`Failed to link items to recommendation options: ${linkErr.message}`);
+      }
+
+      return ok({
+        success: true,
+        message: `Logged recommendation for ${rec.recommended_for} (${sorted.length} option${sorted.length === 1 ? "" : "s"}).`,
+        warnings,
+        recommendation: rec,
+        options: sorted.map((row, i) => ({
+          ...row,
+          items: itemsPerOption[i].map((r) => ({ id: r.item.id, name: r.item.name })),
+        })),
+      });
+    },
+  );
+
+  server.tool(
+    "wd_update_recommendation",
+    "Close the loop on a recommendation identified by `recommendation_id` — usually after the owner reports what he actually wore. Partial update: only the fields you supply change. `chosen_option_id` must belong to this recommendation; `wear_event_id` must be an existing wear event. Options and their items cannot be edited here — if a proposal was logged wrong, wd_delete_recommendation and re-log. Returns the updated recommendation with its options and items.",
+    {
+      recommendation_id: z.string().describe("UUID of the recommendation to update"),
+      outcome: z.enum(["pending", "worn_as_proposed", "worn_with_deviation", "declined", "superseded", "unknown"]).optional(),
+      chosen_option_id: z.string().optional().describe("UUID of the option that was picked; must belong to this recommendation"),
+      wear_event_id: z.string().optional().describe("UUID of the wear event the outfit became, once logged"),
+      deviation_notes: z.string().optional().describe("What he swapped and why — the highest-value field here"),
+      notes: z.string().optional(),
+      context: z.string().optional(),
+      weather: z.string().optional(),
+      audience: z.array(z.string()).optional(),
+      recommended_for: z.string().optional().describe("YYYY-MM-DD, stored literally (no timezone conversion)"),
+    },
+    async ({ recommendation_id, outcome, chosen_option_id, wear_event_id, deviation_notes, notes, context, weather, audience, recommended_for }) => {
+      if (!isUuid(recommendation_id)) {
+        return ok({ success: false, message: `"${recommendation_id}" is not a valid recommendation_id (UUID expected).` });
+      }
+
+      // Confirm the recommendation exists before touching anything.
+      const { data: existing, error: readErr } = await supabase
+        .from("recommendations")
+        .select("*")
+        .eq("id", recommendation_id)
+        .maybeSingle();
+      if (readErr) throw new Error(`Failed to read recommendation: ${readErr.message}`);
+      if (!existing) {
+        return ok({ success: false, message: `No recommendation found with id "${recommendation_id}".` });
+      }
+
+      // chosen_option_id must be one of THIS recommendation's options.
+      if (chosen_option_id !== undefined) {
+        if (!isUuid(chosen_option_id)) {
+          return ok({ success: false, message: `"${chosen_option_id}" is not a valid chosen_option_id (UUID expected).` });
+        }
+        const { data: opt, error: optErr } = await supabase
+          .from("recommendation_options")
+          .select("id, option_index, label")
+          .eq("id", chosen_option_id)
+          .eq("recommendation_id", recommendation_id)
+          .maybeSingle();
+        if (optErr) throw new Error(`Failed to check chosen option: ${optErr.message}`);
+        if (!opt) {
+          const { data: valid, error: validErr } = await supabase
+            .from("recommendation_options")
+            .select("id, option_index, label")
+            .eq("recommendation_id", recommendation_id)
+            .order("option_index", { ascending: true });
+          if (validErr) throw new Error(`Failed to list options: ${validErr.message}`);
+          return ok({
+            success: false,
+            message: `Option "${chosen_option_id}" does not belong to recommendation "${recommendation_id}" — nothing was changed.`,
+            valid_options: valid || [],
+          });
+        }
+      }
+
+      // wear_event_id must reference an existing wear event.
+      if (wear_event_id !== undefined) {
+        if (!isUuid(wear_event_id)) {
+          return ok({ success: false, message: `"${wear_event_id}" is not a valid wear_event_id (UUID expected).` });
+        }
+        const { data: we, error: weErr } = await supabase
+          .from("wear_events")
+          .select("id")
+          .eq("id", wear_event_id)
+          .maybeSingle();
+        if (weErr) throw new Error(`Failed to check wear event: ${weErr.message}`);
+        if (!we) {
+          return ok({ success: false, message: `No wear event found with id "${wear_event_id}" — nothing was changed.` });
+        }
+      }
+
+      const updates: Record<string, unknown> = {};
+      if (outcome !== undefined) updates.outcome = outcome;
+      if (chosen_option_id !== undefined) updates.chosen_option_id = chosen_option_id;
+      if (wear_event_id !== undefined) updates.wear_event_id = wear_event_id;
+      if (deviation_notes !== undefined) updates.deviation_notes = deviation_notes;
+      if (notes !== undefined) updates.notes = notes;
+      if (context !== undefined) updates.context = context;
+      if (weather !== undefined) updates.weather = weather;
+      if (audience !== undefined) updates.audience = audience;
+      if (recommended_for !== undefined) updates.recommended_for = recommended_for;
+
+      if (Object.keys(updates).length === 0) {
+        throw new Error("No fields provided to update.");
+      }
+
+      const { data: rec, error } = await supabase
+        .from("recommendations")
+        .update(updates)
+        .eq("id", recommendation_id)
+        .select("*")
+        .single();
+      if (error) throw new Error(`Failed to update recommendation: ${error.message}`);
+
+      // Return the recommendation with its options and their items.
+      const { data: opts, error: optsErr } = await supabase
+        .from("recommendation_options")
+        .select("*")
+        .eq("recommendation_id", recommendation_id)
+        .order("option_index", { ascending: true });
+      if (optsErr) throw new Error(`Failed to load options: ${optsErr.message}`);
+      const optIds = (opts || []).map((o) => o.id);
+      const { data: links, error: linkErr } = optIds.length > 0
+        ? await supabase
+          .from("recommendation_option_items")
+          .select("recommendation_option_id, items(id, name, category)")
+          .in("recommendation_option_id", optIds)
+        : { data: [], error: null };
+      if (linkErr) throw new Error(`Failed to load option items: ${linkErr.message}`);
+
+      const byOption = new Map<string, unknown[]>();
+      for (const l of links || []) {
+        const arr = byOption.get(l.recommendation_option_id) || [];
+        arr.push(l.items);
+        byOption.set(l.recommendation_option_id, arr);
+      }
+
+      return ok({
+        success: true,
+        message: `Updated recommendation for ${rec.recommended_for} (outcome: ${rec.outcome}).`,
+        recommendation: rec,
+        options: (opts || []).map((o) => ({ ...o, items: byOption.get(o.id) || [] })),
+      });
+    },
+  );
+
+  server.tool(
+    "wd_delete_recommendation",
+    "Delete a recommendation and all of its options and item links, identified by `recommendation_id`. Use when a proposal was logged wrong: delete and re-log (options/items cannot be edited in place). Returns the deleted id, its recommended_for date, and the number of options removed.",
+    {
+      recommendation_id: z.string().describe("UUID of the recommendation to delete"),
+    },
+    async ({ recommendation_id }) => {
+      if (!isUuid(recommendation_id)) {
+        return ok({ success: false, message: `"${recommendation_id}" is not a valid recommendation_id (UUID expected).` });
+      }
+
+      const { data: existing, error: readErr } = await supabase
+        .from("recommendations")
+        .select("id, recommended_for")
+        .eq("id", recommendation_id)
+        .maybeSingle();
+      if (readErr) throw new Error(`Failed to read recommendation: ${readErr.message}`);
+      if (!existing) {
+        return ok({ success: false, message: `No recommendation found with id "${recommendation_id}".` });
+      }
+
+      const { count, error: countErr } = await supabase
+        .from("recommendation_options")
+        .select("*", { count: "exact", head: true })
+        .eq("recommendation_id", recommendation_id);
+      if (countErr) throw new Error(`Failed to count options: ${countErr.message}`);
+      const removed = count ?? 0;
+
+      // Cascade delete removes options and their item links.
+      const { error: delErr } = await supabase
+        .from("recommendations")
+        .delete()
+        .eq("id", recommendation_id);
+      if (delErr) throw new Error(`Failed to delete recommendation: ${delErr.message}`);
+
+      return ok({
+        success: true,
+        message: `Deleted recommendation for ${existing.recommended_for} and ${removed} option${removed === 1 ? "" : "s"}.`,
+        deleted_recommendation_id: existing.id,
+        recommended_for: existing.recommended_for,
+        options_removed: removed,
+      });
+    },
+  );
+
+  server.tool(
     "wd_save_outfit",
-    "Save a named, reusable outfit combination that is known to work. Every ref in `item_refs` must resolve before anything is written.",
+    "Save a named, reusable outfit combination that is known to work. Every ref in `item_refs` must resolve before anything is written. Always supply `register_note` and `paradigm_note`: `register` is the one-word bucket for filtering; the notes are the prose tags on both axes, including mixing and collisions.",
     {
       name: z.string().describe('e.g. "bleu de travail + ecru workshirt + tan chinos + Aldens"'),
       item_refs: z.array(z.string()).min(1).describe("Items in the outfit (UUIDs or name substrings)"),
       register: z.string().optional().describe("heritage_workwear | smart_casual | tailored | crossover | athletic"),
       occasion: z.string().optional().describe("What it's for"),
       notes: z.string().optional().describe("Why it works, caveats"),
+      register_note: z.string().optional().describe("Free text: which register(s) the outfit sits in, with any mixing or collision noted"),
+      paradigm_note: z.string().optional().describe("Free text: which Crompton paradigm(s) it draws on, with overlap or ambiguity noted"),
     },
-    async ({ name, item_refs, register, occasion, notes }) => {
+    async ({ name, item_refs, register, occasion, notes, register_note, paradigm_note }) => {
       const { resolved, problems } = await resolveItemRefs(supabase, item_refs);
       if (problems.length > 0) {
         return ok({
@@ -538,6 +1431,8 @@ function buildServer(supabase: SupabaseClient): McpServer {
       if (register) outfitRow.register = register;
       if (occasion) outfitRow.occasion = occasion;
       if (notes) outfitRow.notes = notes;
+      if (register_note) outfitRow.register_note = register_note;
+      if (paradigm_note) outfitRow.paradigm_note = paradigm_note;
 
       const { data: outfit, error: outfitErr } = await supabase
         .from("outfits")
@@ -588,7 +1483,7 @@ function buildServer(supabase: SupabaseClient): McpServer {
 
   server.tool(
     "wd_get_inventory",
-    "List wardrobe items with optional filters. Retired items are excluded unless you pass status='retired' (or status='all').",
+    "List wardrobe items with optional filters. Retired items are excluded unless you pass status='retired' (or status='all'). Every row carries its own wear and recommendation recency, so composing a recommendation needs no second call. `total_wears` is the authoritative wear count for an item. Claims that an item has never been worn, or is on its first wear, must be sourced from this field. Do not infer wear history from `condition`, `acquired_on`, `fit_notes`, or prose in `notes` — those fields are frequently stale and are not wear data. A `total_wears` of 0 means never worn, and is stated as 0 rather than omitted. `last_recommended_for` is the other half of recency: an item that was recommended but not worn still counts against the 7-day rule for shirts, tees and socks.",
     {
       category: z.string().optional(),
       register: z.string().optional(),
@@ -617,15 +1512,24 @@ function buildServer(supabase: SupabaseClient): McpServer {
       q = q.order("category", { ascending: true }).order("name", { ascending: true })
         .limit(limit || 200);
 
-      const { data, error } = await q;
-      if (error) throw new Error(`Failed to list inventory: ${error.message}`);
-      return ok({ success: true, count: data.length, items: data });
+      // Items and stats in parallel: two round trips total, regardless of how
+      // many rows come back.
+      const [itemsRes, statsMap] = await Promise.all([q, fetchStatsMap(supabase)]);
+      if (itemsRes.error) {
+        throw new Error(`Failed to list inventory: ${itemsRes.error.message}`);
+      }
+
+      const items = (itemsRes.data || []).map((item) => ({
+        ...item,
+        ...normalizeStats(statsMap.get(item.id)),
+      }));
+      return ok({ success: true, count: items.length, items });
     },
   );
 
   server.tool(
     "wd_get_item",
-    "Get the full record for one item plus its wear statistics (total wears, last worn, days since worn, wears in last 30/90 days). Reference by `item_id` or unambiguous `name_match`.",
+    "Get the full record for one item plus its wear statistics (total wears, last worn, days since worn, wears in last 30/90 days) and its recommendation recency. Reference by `item_id` or unambiguous `name_match`. `total_wears` is the authoritative wear count for an item. Claims that an item has never been worn, or is on its first wear, must be sourced from this field. Do not infer wear history from `condition`, `acquired_on`, `fit_notes`, or prose in `notes` — those fields are frequently stale and are not wear data. These numbers come from the same view that backs `wd_get_inventory`, so the two tools always agree.",
     {
       item_id: z.string().optional().describe("Item UUID"),
       name_match: z.string().optional().describe("Case-insensitive substring of the item name; must be unambiguous"),
@@ -636,12 +1540,33 @@ function buildServer(supabase: SupabaseClient): McpServer {
 
       const [itemRes, statsRes] = await Promise.all([
         supabase.from("items").select(ITEM_COLUMNS).eq("id", id.value).single(),
-        supabase.from("v_item_wear_stats").select("*").eq("id", id.value).maybeSingle(),
+        supabase.from("v_item_stats").select(STATS_COLUMNS).eq("id", id.value).maybeSingle(),
       ]);
       if (itemRes.error) throw new Error(`Failed to get item: ${itemRes.error.message}`);
-      if (statsRes.error) throw new Error(`Failed to get wear stats: ${statsRes.error.message}`);
+      if (statsRes.error) throw new Error(`Failed to get item stats: ${statsRes.error.message}`);
 
-      return ok({ success: true, item: itemRes.data, wear_stats: statsRes.data });
+      const stats = normalizeStats(statsRes.data);
+      return ok({
+        success: true,
+        item: itemRes.data,
+        wear_stats: {
+          id: itemRes.data.id,
+          name: itemRes.data.name,
+          category: itemRes.data.category,
+          register: itemRes.data.register,
+          status: itemRes.data.status,
+          total_wears: stats.total_wears,
+          last_worn: stats.last_worn,
+          days_since_worn: stats.days_since_worn,
+          wears_30d: stats.wears_30d,
+          wears_90d: stats.wears_90d,
+        },
+        recommendation_stats: {
+          total_recommendations: stats.total_recommendations,
+          last_recommended_for: stats.last_recommended_for,
+          days_since_recommended: stats.days_since_recommended,
+        },
+      });
     },
   );
 
@@ -709,6 +1634,127 @@ function buildServer(supabase: SupabaseClient): McpServer {
 
       const enriched = events.map((e) => ({ ...e, items: byEvent.get(e.id) || [] }));
       return ok({ success: true, count: enriched.length, events: enriched });
+    },
+  );
+
+  server.tool(
+    "wd_recommendation_history",
+    "List recommendations, newest first by recommended_for, each with its options and their items (plus outcome, deviation_notes, and chosen_option_id). Filter by date range, a specific item (only proposals that included it in any option), outcome, audience tag, or context substring. This is the exclusion step before proposing: check what was recently recommended, not just recently worn. Each item carries days_since_recommended.",
+    {
+      item_id: z.string().optional().describe("Only recommendations that included this item UUID in any option"),
+      name_match: z.string().optional().describe("Only recommendations including the item matching this name substring (must be unambiguous)"),
+      outcome: z.string().optional().describe("pending | worn_as_proposed | worn_with_deviation | declined | superseded | unknown"),
+      audience: z.string().optional().describe("Only recommendations tagged with this audience, e.g. 'team' or 'Webb'"),
+      context: z.string().optional().describe("Case-insensitive substring match on context"),
+      from: z.string().optional().describe("YYYY-MM-DD, inclusive lower bound on recommended_for"),
+      to: z.string().optional().describe("YYYY-MM-DD, inclusive upper bound on recommended_for"),
+      limit: z.number().int().optional().describe("Max recommendations (default 20)"),
+    },
+    async ({ item_id, name_match, outcome, audience, context, from, to, limit }) => {
+      let restrictRecIds: string[] | null = null;
+      if (item_id || name_match) {
+        const id = await resolveSingleId(supabase, item_id, name_match);
+        if ("error" in id) return id.error;
+        const { data: itemLinks, error: ilErr } = await supabase
+          .from("recommendation_option_items")
+          .select("recommendation_option_id")
+          .eq("item_id", id.value);
+        if (ilErr) throw new Error(`Failed to filter by item: ${ilErr.message}`);
+        const optIds = (itemLinks || []).map((l) => l.recommendation_option_id);
+        if (optIds.length === 0) {
+          return ok({ success: true, count: 0, recommendations: [], note: "No recommendations include that item." });
+        }
+        const { data: opts, error: optErr } = await supabase
+          .from("recommendation_options")
+          .select("recommendation_id")
+          .in("id", optIds);
+        if (optErr) throw new Error(`Failed to filter by item: ${optErr.message}`);
+        restrictRecIds = [...new Set((opts || []).map((o) => o.recommendation_id))];
+      }
+
+      let q = supabase.from("recommendations").select("*");
+      if (restrictRecIds) q = q.in("id", restrictRecIds);
+      if (outcome) q = q.eq("outcome", outcome);
+      if (audience) q = q.contains("audience", [audience]);
+      if (context) q = q.ilike("context", `%${context}%`);
+      if (from) q = q.gte("recommended_for", from);
+      if (to) q = q.lte("recommended_for", to);
+      q = q.order("recommended_for", { ascending: false }).limit(limit || 20);
+
+      const { data: recs, error } = await q;
+      if (error) throw new Error(`Failed to get recommendation history: ${error.message}`);
+      if (!recs || recs.length === 0) {
+        return ok({ success: true, count: 0, recommendations: [] });
+      }
+
+      // Attach options and their items.
+      const recIds = recs.map((r) => r.id);
+      const { data: opts, error: optsErr } = await supabase
+        .from("recommendation_options")
+        .select("*")
+        .in("recommendation_id", recIds)
+        .order("option_index", { ascending: true });
+      if (optsErr) throw new Error(`Failed to load options: ${optsErr.message}`);
+
+      const optIds = (opts || []).map((o) => o.id);
+      const { data: links, error: linkErr } = optIds.length > 0
+        ? await supabase
+          .from("recommendation_option_items")
+          .select("recommendation_option_id, items(id, name, category)")
+          .in("recommendation_option_id", optIds)
+        : { data: [], error: null };
+      if (linkErr) throw new Error(`Failed to load option items: ${linkErr.message}`);
+
+      const itemsByOption = new Map<string, unknown[]>();
+      for (const l of links || []) {
+        const arr = itemsByOption.get(l.recommendation_option_id) || [];
+        arr.push(l.items);
+        itemsByOption.set(l.recommendation_option_id, arr);
+      }
+      const optionsByRec = new Map<string, unknown[]>();
+      // Both dates are literal YYYY-MM-DD, so Date.parse compares them at UTC
+      // midnight and the difference is exact whole days.
+      const today = todayLA();
+      for (const o of opts || []) {
+        const rec = recs.find((r) => r.id === o.recommendation_id);
+        const daysSince = rec
+          ? Math.floor((Date.parse(today) - Date.parse(rec.recommended_for)) / 86400000)
+          : null;
+        const arr = optionsByRec.get(o.recommendation_id) || [];
+        arr.push({
+          ...o,
+          items: (itemsByOption.get(o.id) || []).map((it) => ({
+            ...(it as Record<string, unknown>),
+            days_since_recommended: daysSince,
+          })),
+        });
+        optionsByRec.set(o.recommendation_id, arr);
+      }
+
+      const enriched = recs.map((r) => ({ ...r, options: optionsByRec.get(r.id) || [] }));
+      return ok({ success: true, count: enriched.length, recommendations: enriched });
+    },
+  );
+
+  server.tool(
+    "wd_eligibility",
+    "Deterministic 7-day rotation eligibility for a given date — the one source of truth for the shirt / tee / sock recency rule. Call this before composing a recommendation and quote its buckets; never derive eligibility from inventory or history yourself. Governed = active items in category shirt, tee or socks, plus knitwear whose subcategory is a tee / t-shirt / tank (loopwheel tees are catalogued under knitwear). Buckets, first match wins: `blocked_worn` (worn 0–6 days before for_date — never propose), `boundary` (worn exactly 7 days before — eligible, flagged), `config_flag` (an unworn recommendation inside the window — the item IS eligible, but do not re-propose that configuration; the other items from that option are attached), `eligible`, `exempt` (not governed — shown for information, never blocked). Items with `under_rotation` (no logged wear, or unworn >= dormancy_days) never land in config_flag. `never_worn` and `never_recommended` list governed items by name so a null never has to be noticed. Every list is complete and sorted by name; `days_since_*` count back from for_date, not from today. The returned `run_id` is required by wd_log_recommendation for the same date and stays valid for 30 minutes.",
+    {
+      for_date: z.string().describe("YYYY-MM-DD the outfit is FOR; compared literally, no timezone conversion"),
+      categories: z.array(z.string()).optional().describe("Categories to evaluate (default: shirt, tee, socks, knitwear). Any other category is returned as exempt with its recency, never blocked."),
+      dormancy_days: z.number().int().optional().describe("Threshold for the under_rotation flag (default 30)"),
+    },
+    async ({ for_date, categories, dormancy_days }) => {
+      if (!isLiteralDate(for_date)) {
+        return ok({ success: false, message: `"${for_date}" is not a valid for_date (YYYY-MM-DD expected).` });
+      }
+      const result = await computeEligibility(
+        supabase,
+        for_date,
+        categories && categories.length > 0 ? categories : undefined,
+        dormancy_days,
+      );
+      return ok({ success: true, ...result });
     },
   );
 

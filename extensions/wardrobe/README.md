@@ -73,7 +73,13 @@ Follow the [Deploy an Edge Function](../../primitives/deploy-edge-function/) gui
 | Function name | `wardrobe-mcp` |
 | Download path | `extensions/wardrobe` |
 
-The function reads one secret, `MCP_ACCESS_KEY`, which you already set for your core Open Brain. Reuse it — no new secret needed. Deploy with `--no-verify-jwt`:
+The function reads two secrets. `MCP_ACCESS_KEY` you already set for your core Open Brain — reuse it. `WD_ELIGIBILITY_SECRET` is new and dedicated: it signs `wd_eligibility` run tokens and must **not** be the service role key. Any random 32+ byte string works:
+
+```bash
+supabase secrets set WD_ELIGIBILITY_SECRET=$(openssl rand -hex 32)
+```
+
+Then deploy with `--no-verify-jwt`:
 
 ```bash
 supabase functions deploy wardrobe-mcp --no-verify-jwt
@@ -101,19 +107,28 @@ All tools use the `wd_` prefix and return JSON. Item references accept either `i
 1. **`wd_add_item`** — Add a garment/accessory. Required: `name`, `category`. Everything else optional. Use `status: "incoming"` for ordered-not-arrived.
 2. **`wd_update_item`** — Partial update by id or unambiguous name. Fit notes, condition, pairing notes, status changes.
 3. **`wd_retire_item`** — Convenience: sets `status: "retired"`, records `retired_on`, appends a reason to notes.
-4. **`wd_log_wear`** — Log an outfit-of-the-day: one wear event + links to every item worn. Resolves **all** refs before writing; on any unresolved ref it logs nothing and returns the problems. `worn_on` defaults to today in America/Los_Angeles.
-5. **`wd_update_wear`** — Partial edit of a wear event by `event_id`: `worn_on`, `context`, `weather`, `audience`, `rating`, `notes`. Optionally pass `item_refs` to **replace** the linked items (resolved all-or-nothing, same as `wd_log_wear`). `worn_on` is stored as a literal date.
+4. **`wd_log_wear`** — Log an outfit-of-the-day: one wear event + links to every item worn. Resolves **all** refs before writing; on any unresolved ref it logs nothing and returns the problems. `worn_on` defaults to today in America/Los_Angeles. Carries `register_note` and `paradigm_note` (see below).
+5. **`wd_update_wear`** — Partial edit of a wear event by `event_id`: `worn_on`, `context`, `weather`, `audience`, `rating`, `notes`, `register_note`, `paradigm_note`. Optionally pass `item_refs` to **replace** the linked items (resolved all-or-nothing, same as `wd_log_wear`). `worn_on` is stored as a literal date.
 6. **`wd_delete_wear`** — Delete a wear event and its item links by `event_id`. Returns the deleted id, `worn_on`, and the number of item links removed.
-7. **`wd_save_outfit`** — Persist a named, reusable combination with register and notes.
-8. **`wd_mark_review_done`** — Sets `last_rotation_review` to today. Call at the end of a rotation review.
+7. **`wd_log_recommendation`** — Log an outfit proposal at the moment it's made: one call per proposal event, with an `options` array (one entry per option offered, each with its own `item_refs`, optional `label` and `rationale`, and its own `register_note` and `paradigm_note`). All-or-nothing resolution across every option. `recommended_for` is stored literally; `proposed_on` defaults to today in America/Los_Angeles; `outcome` starts as `pending`. **Requires `eligibility_run_id`** from a `wd_eligibility` run for the same date, no older than 30 minutes; eligibility is recomputed at write time and any option containing a `blocked_worn` item is refused with nothing written (see below).
+8. **`wd_update_recommendation`** — Close the loop by `recommendation_id`: set `outcome` (`worn_as_proposed` | `worn_with_deviation` | `declined` | `superseded` | `unknown`), `chosen_option_id` (validated against this recommendation's options), `wear_event_id`, and `deviation_notes` — the what-he-swapped-and-why signal. Options/items can't be edited; delete and re-log instead.
+9. **`wd_delete_recommendation`** — Delete a recommendation with its options and item links by `recommendation_id`.
+10. **`wd_save_outfit`** — Persist a named, reusable combination with register, notes, `register_note` and `paradigm_note`.
+11. **`wd_mark_review_done`** — Sets `last_rotation_review` to today. Call at the end of a rotation review.
 
 **Reads**
 
-9. **`wd_get_inventory`** — List items with filters: `category`, `register`, `status`, `color_family`, `season`, `weight`. Excludes retired unless asked.
-10. **`wd_get_item`** — Full record for one item plus its wear stats (total/last/30d/90d).
-11. **`wd_wear_history`** — Wear events filtered by date range, item, context, or audience tag. Answers "when did I last wear X around Y."
-12. **`wd_rotation_report`** — Dormant (unworn ≥ N days, default 60), over-worn (≥ M wears in 30 days, default 6), and `under_review` items, plus `last_rotation_review` and `days_since_review`. N and M overridable.
-13. **`wd_get_outfits`** — Saved outfits, optionally filtered by register or by containing item.
+12. **`wd_get_inventory`** — List items with filters: `category`, `register`, `status`, `color_family`, `season`, `weight`. Excludes retired unless asked.
+13. **`wd_get_item`** — Full record for one item plus its wear stats (total/last/30d/90d).
+14. **`wd_wear_history`** — Wear events filtered by date range, item, context, or audience tag. Answers "when did I last wear X around Y."
+15. **`wd_recommendation_history`** — Recommendations (newest first by `recommended_for`) with their options, items, `outcome`, `deviation_notes`, and `chosen_option_id`; filter by date range, item, outcome, audience, or context. Each item carries `days_since_recommended` — the exclusion step before proposing anything new.
+16. **`wd_eligibility`** — Deterministic 7-day rotation eligibility for a date (see the note below). Returns every governed item in exactly one bucket — `blocked_worn`, `boundary`, `config_flag`, `eligible` — plus `exempt` for requested non-governed categories, `never_worn` / `never_recommended` name lists, and a signed `run_id`.
+17. **`wd_rotation_report`** — Dormant (unworn ≥ N days, default 60), over-worn (≥ M wears in 30 days, default 6), and `under_review` items, plus `last_rotation_review` and `days_since_review`. N and M overridable.
+18. **`wd_get_outfits`** — Saved outfits, optionally filtered by register or by containing item.
+
+> **Register and paradigm tags.** Every formulated outfit — each recommendation option, each saved outfit, each wear event — carries two free-text fields: `register_note` (your own register system, which bundles lineage with a formality band) and `paradigm_note` (Simon Crompton's lineage-only taxonomy from *Five paradigms of casual clothing*, Permanent Style, 2018: British country, American prep, Italian smooth, Workwear, Sportswear). They are prose rather than enums on purpose: the interesting outfits are mixed, and a note can say "Workwear throughout; Italian smooth at the knit; deliberate collision at the footwear" where a category could not. The agent should fill both every time. Added in `migrations/003_register_paradigm_notes.sql`.
+
+> **Rotation eligibility.** The 7-day recency rule — *never recommend the same shirt, sock, or tee within a rolling 7 days; recommended-but-unworn suppresses re-proposing the same configuration, not the item, and never applies to an under-rotation item* — is computed in one place in the edge function and never by the agent. `wd_eligibility(for_date)` evaluates every active item in `shirt`, `tee`, `socks`, and `knitwear` (knitwear is governed only where the subcategory is a tee / t-shirt / tank — loopwheel tees are catalogued there; sweaters, hoodies, henleys and vests come back `exempt`). Buckets, first match wins: `blocked_worn` (worn 0–6 days before `for_date`), `boundary` (exactly 7 — eligible, flagged), `config_flag` (an unworn recommendation 0–6 days before — the item is eligible, that configuration is not; the other items from that option are attached), `eligible`, `exempt`. `under_rotation` (no logged wear, or unworn ≥ `dormancy_days`, default 30) never lands in `config_flag`. `never_worn` and `never_recommended` are surfaced as name lists so a null is never something the reader has to notice. The response's `run_id` is a stateless HMAC token (`WD_ELIGIBILITY_SECRET`) over `{for_date, computed_at}`; `wd_log_recommendation` requires it, checks signature, date and age (30 minutes), then recomputes eligibility at write time and refuses the whole call (`blocked_items`) if any option contains a blocked item. `boundary` and `config_flag` items are written but returned in `warnings`. The token is stored on the row as a receipt (`migrations/004_eligibility_run_id.sql`).
 
 > **Note on qualitative notes.** There is intentionally no `wd_get_style_notes` tool and no `style_notes` table. Style identity, registers, principles, and person notes live in the base Open Brain `thoughts` store — capture them with `capture_thought` and retrieve them with `search_thoughts`. This keeps the structured wardrobe data and the qualitative wiki cleanly separated, and makes your style profile available to every connected AI, not just this extension.
 
@@ -149,6 +164,12 @@ For common issues (connection errors, 401s, deployment problems), see [Common Tr
 
 **`wd_log_wear` returns `success: false` with an `unresolved` list**
 - This is by design — it resolves every item before writing so you never half-log an outfit. Fix the listed refs (use the returned candidate UUIDs for ambiguous names, or add the missing item first) and call again.
+
+**`wd_log_recommendation` returns `error: eligibility_run_invalid` / `eligibility_run_date_mismatch` / `eligibility_run_stale`**
+- Call `wd_eligibility` for the same `recommended_for` and pass its `run_id`. Runs expire after 30 minutes; a run for a different date is refused. If the error mentions `WD_ELIGIBILITY_SECRET`, the secret was never set — see step 2.
+
+**`wd_log_recommendation` returns `error: blocked_items`**
+- By design: a governed item in one of the options was worn inside the 7-day window for that date. Nothing was written. Swap the named item and retry with the same run (or a fresh one).
 
 **"Ambiguous name match" on an update or lookup**
 - Two or more items share that substring. Pass `item_id` (from the returned candidates) instead of `name_match`.
