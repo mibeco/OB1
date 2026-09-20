@@ -9,10 +9,52 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
-const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
+const OB_ACCESS_KEY = Deno.env.get("OB_ACCESS_KEY")!;
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+/**
+ * The database credential this function runs under.
+ *
+ * `OB_DB_TOKEN` is a JWT whose `role` claim is `open_brain_mcp` — a role
+ * granted exactly what this server uses and nothing else: `public.thoughts`,
+ * `match_thoughts`, `upsert_thought`, and usage on the `extensions` schema for
+ * the `vector` type. It has NOBYPASSRLS, so row-level security actually
+ * applies to it (see server/migrations/001_least_privilege_role.sql).
+ *
+ * What that replaces: `service_role`, which carries BYPASSRLS and, audited
+ * 2026-09-20, could read 30 tables across 5 schemas with full CRUD —
+ * `vault.secrets`, `vault.decrypted_secrets`, every storage bucket, and every
+ * wardrobe table. This server reads one table. The code was always
+ * well-behaved; the credential simply reached far past it, and the thing it
+ * guards — 155 rows of personal memory — deserved better than a key that also
+ * opened everything else in the project.
+ *
+ * The `apikey` header must still be a real project API key: the Supabase
+ * gateway checks it before PostgREST is reached and rejects anything else with
+ * "Invalid API key". It is the Authorization bearer that selects the database
+ * role. The anon key serves as gateway admission and grants nothing on its own.
+ *
+ * FALLBACK, deliberate. With `OB_DB_TOKEN` unset this reverts to the service
+ * role, so a bad deploy is undone by `supabase secrets unset OB_DB_TOKEN` with
+ * no code change. That is also the mitigation for the standing risk that
+ * Supabase retires the legacy HS256 verification this token relies on — its
+ * signing secret is the dashboard's "Legacy JWT secret", because the project
+ * now signs with ES256 keys that cannot sign claims of our choosing.
+ *
+ * Presence of OB_DB_TOKEN decides the mode on its own. There is deliberately
+ * no path where the scoped role is requested and service-role access is what
+ * actually runs — a silent downgrade would look like a clean deploy while the
+ * privilege reduction quietly had not happened.
+ */
+const OB_DB_TOKEN = Deno.env.get("OB_DB_TOKEN");
+
+const supabase = OB_DB_TOKEN
+  ? createClient(
+    SUPABASE_URL,
+    Deno.env.get("SUPABASE_ANON_KEY") ?? SUPABASE_SERVICE_ROLE_KEY,
+    { global: { headers: { Authorization: `Bearer ${OB_DB_TOKEN}` } } },
+  )
+  : createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 type ThoughtMatch = {
   id: string;
@@ -508,7 +550,7 @@ server.registerTool(
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-brain-key, accept, mcp-session-id, mcp-protocol-version, last-event-id",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-access-key, x-brain-key, accept, mcp-session-id, mcp-protocol-version, last-event-id",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
 };
 
@@ -597,9 +639,14 @@ app.options("*", (c) => {
 });
 
 app.all("*", async (c) => {
-  // Accept access key via header OR URL query parameter
-  const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== MCP_ACCESS_KEY) {
+  // Accept the access key via either header name, or the URL query parameter.
+  // `x-access-key` is the name the other Open Brain functions use; accepting it
+  // here too means every connector in this project is configured identically,
+  // which is what stops a key ending up back in a URL for want of a matching
+  // header name. Prefer a header: query strings leak into history and logs.
+  const provided = c.req.header("x-access-key") || c.req.header("x-brain-key") ||
+    new URL(c.req.url).searchParams.get("key");
+  if (!provided || provided !== OB_ACCESS_KEY) {
     // Return a JSON-RPC 2.0 error envelope (HTTP 200) instead of a bare
     // HTTP 401 so strict MCP hosts treat this as an application-level
     // error rather than a transport fault and keep the connection alive.
