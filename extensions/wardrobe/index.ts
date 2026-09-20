@@ -30,6 +30,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { z } from "zod";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const WD_ACCESS_KEY = Deno.env.get("WD_ACCESS_KEY");
 
@@ -2589,6 +2590,93 @@ function databaseClient(): SupabaseClient {
   });
 }
 
+// --- OAuth 2.1 resource server (dormant until configured) ----------------
+
+/**
+ * OAuth, as a resource server in front of Supabase Auth's OAuth 2.1 server.
+ *
+ * DORMANT BY DEFAULT. Nothing here runs unless all three secrets are set:
+ *
+ *   WD_PUBLIC_URL          this server's URL EXACTLY as typed into the
+ *                          connector. It becomes `resource` in the metadata,
+ *                          and Claude requires the two to match to the byte.
+ *   WD_OAUTH_CLIENT_IDS    comma-separated OAuth client ids allowed to call.
+ *   WD_OAUTH_ALLOWED_SUBS  comma-separated user UUIDs allowed to call.
+ *
+ * Until then the server behaves exactly as before: shared key, 200-wrapped
+ * refusals, OAuth probes 404. Unset any one of them to switch it back off.
+ *
+ * WHY THE LAST TWO ARE NOT OPTIONAL. Supabase sets `aud` to the fixed string
+ * "authenticated" on every token the project issues; it validates the RFC 8707
+ * `resource` parameter but never binds it into the token. So signature +
+ * issuer + audience — the textbook check — accepts ANY token this project has
+ * ever minted for anyone, including a stranger who signed up. What actually
+ * ties a token to this server is `client_id` (present only on tokens issued
+ * through the OAuth server, to that registered client) and `sub` (an explicit
+ * allowlist of owners — in practice one). If Supabase ever ships audience
+ * binding, check `aud` against WD_PUBLIC_URL and keep these anyway.
+ */
+function envList(name: string): Set<string> {
+  return new Set(
+    (Deno.env.get(name) ?? "").split(",").map((v) => v.trim()).filter(Boolean),
+  );
+}
+
+const WD_PUBLIC_URL = Deno.env.get("WD_PUBLIC_URL")?.trim();
+const WD_OAUTH_CLIENT_IDS = envList("WD_OAUTH_CLIENT_IDS");
+const WD_OAUTH_ALLOWED_SUBS = envList("WD_OAUTH_ALLOWED_SUBS");
+const OAUTH_ENABLED = Boolean(
+  WD_PUBLIC_URL && WD_OAUTH_CLIENT_IDS.size && WD_OAUTH_ALLOWED_SUBS.size,
+);
+
+const OAUTH_ISSUER = `${Deno.env.get("SUPABASE_URL")}/auth/v1`;
+const OAUTH_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource";
+const OAUTH_RESOURCE_METADATA_URL = `${WD_PUBLIC_URL}${OAUTH_RESOURCE_METADATA_PATH}`;
+
+// Fetched lazily and cached by jose; rotated keys are picked up on a kid miss.
+const oauthJwks = createRemoteJWKSet(
+  new URL(`${OAUTH_ISSUER}/.well-known/jwks.json`),
+);
+
+/** A bearer value shaped like a JWT, as opposed to the static access key. */
+function looksLikeJwt(token: string | undefined): token is string {
+  return Boolean(token) && token!.split(".").length === 3;
+}
+
+/**
+ * Verify an OAuth access token. Returns the caller, or null for ANY failure —
+ * the reason is logged, never sent to the client.
+ *
+ * Asymmetric algorithms only: the project's legacy HS256 secret also signs
+ * valid-looking tokens (the database role token is one), and none of those
+ * may ever authenticate a caller here.
+ */
+async function verifyOAuthToken(
+  token: string,
+): Promise<{ sub: string; clientId: string } | null> {
+  try {
+    const { payload } = await jwtVerify(token, oauthJwks, {
+      issuer: OAUTH_ISSUER,
+      audience: "authenticated",
+      algorithms: ["ES256", "RS256"],
+    });
+    const sub = typeof payload.sub === "string" ? payload.sub : "";
+    const clientId = typeof payload.client_id === "string" ? payload.client_id : "";
+    if (!clientId || !WD_OAUTH_CLIENT_IDS.has(clientId)) {
+      console.warn(`oauth: rejected, client_id not allowed (${clientId || "none"})`);
+      return null;
+    }
+    if (!sub || !WD_OAUTH_ALLOWED_SUBS.has(sub)) {
+      console.warn(`oauth: rejected, sub not allowed (${sub || "none"})`);
+      return null;
+    }
+    return { sub, clientId };
+  } catch (e) {
+    console.warn(`oauth: rejected, ${(e as Error).message}`);
+    return null;
+  }
+}
+
 // --- Hono app: auth + CORS + transport -----------------------------------
 
 const corsHeaders = {
@@ -2643,6 +2731,36 @@ function unauthorizedResponse(id: string | number | null): Response {
   );
 }
 
+/**
+ * The OAuth refusal: a real HTTP 401 carrying `WWW-Authenticate`. Claude only
+ * starts (or refreshes) an OAuth flow on a transport-level 401 — it ignores
+ * the header on a 200 — and `resource_metadata` is how it finds the metadata
+ * on a host that cannot serve `/.well-known/*` at its root.
+ */
+function oauthChallengeResponse(
+  id: string | number | null,
+  tokenWasPresented: boolean,
+): Response {
+  const challenge = `Bearer resource_metadata="${OAUTH_RESOURCE_METADATA_URL}"` +
+    (tokenWasPresented ? `, error="invalid_token"` : "");
+  return new Response(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code: JSON_RPC_UNAUTHORIZED_CODE, message: UNAUTHORIZED_MESSAGE },
+      id,
+    }),
+    {
+      status: 401,
+      headers: {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": challenge,
+        ...corsHeaders,
+        "Access-Control-Expose-Headers": "WWW-Authenticate",
+      },
+    },
+  );
+}
+
 const app = new Hono();
 
 app.options("*", (c) => c.text("ok", 200, corsHeaders));
@@ -2672,7 +2790,22 @@ const OAUTH_PROBE_PATH_RE =
   /\/\.well-known\/(oauth-authorization-server|oauth-protected-resource|openid-configuration)|\/register$/;
 
 app.use("*", async (c, next) => {
-  if (OAUTH_PROBE_PATH_RE.test(new URL(c.req.url).pathname)) {
+  const pathname = new URL(c.req.url).pathname;
+  // With OAuth configured, this one document exists; the authorization server
+  // lives at Supabase Auth, so every other probe path still 404s.
+  if (OAUTH_ENABLED && pathname.endsWith(OAUTH_RESOURCE_METADATA_PATH)) {
+    return c.json(
+      {
+        resource: WD_PUBLIC_URL,
+        authorization_servers: [OAUTH_ISSUER],
+        bearer_methods_supported: ["header"],
+        resource_name: "Wardrobe System",
+      },
+      200,
+      { ...corsHeaders, "Cache-Control": "no-store" },
+    );
+  }
+  if (OAUTH_PROBE_PATH_RE.test(pathname)) {
     return c.json(
       {
         error: "not_found",
@@ -2827,15 +2960,34 @@ function isUnauthenticatedRequest(bodyText: string | null): boolean {
 }
 
 app.all("*", async (c) => {
+  const bearer = bearerToken(c.req.header("authorization"));
   const provided = c.req.query("key") ||
-    c.req.header("x-access-key") || c.req.header("x-brain-key") ||
-    bearerToken(c.req.header("authorization"));
-  const authenticated = Boolean(WD_ACCESS_KEY) && provided === WD_ACCESS_KEY;
+    c.req.header("x-access-key") || c.req.header("x-brain-key") || bearer;
+  let authenticated = Boolean(WD_ACCESS_KEY) && provided === WD_ACCESS_KEY;
+
+  // OAuth is an ADDITIONAL way in, never a replacement check: the static key
+  // keeps working until it is deliberately removed.
+  const presentedJwt = OAUTH_ENABLED && !authenticated && looksLikeJwt(bearer);
+  if (presentedJwt) {
+    const caller = await verifyOAuthToken(bearer!);
+    if (caller) {
+      authenticated = true;
+      console.log(`oauth: accepted sub=${caller.sub} client=${caller.clientId}`);
+    }
+  }
 
   // The body has to be read to see which method is being called, and a request
   // body can only be consumed once — so it is read here and replayed into the
   // transport below rather than passed through as a stream.
   const bodyText = await readBodyText(c.req.raw);
+
+  // Once OAuth is on, an unauthenticated caller gets the 401 challenge for
+  // everything — including the handshake. The open handshake below exists
+  // only so a "no sign-in" connector can register; an OAuth connector needs
+  // the opposite signal.
+  if (!authenticated && OAUTH_ENABLED) {
+    return oauthChallengeResponse(extractJsonRpcId(bodyText), presentedJwt);
+  }
 
   if (!authenticated && !isUnauthenticatedRequest(bodyText)) {
     return unauthorizedResponse(extractJsonRpcId(bodyText));
