@@ -2528,6 +2528,67 @@ async function resolveSingleId(
   };
 }
 
+/**
+ * The database credential the function runs under.
+ *
+ * `WD_DB_TOKEN` is a JWT whose `role` claim is `wardrobe_mcp` — a role with
+ * grants on the ten wardrobe tables, the wardrobe views and the
+ * `wardrobe-photos` bucket, and NOBYPASSRLS, so row-level security actually
+ * applies to it (see migrations/006_least_privilege_role.sql).
+ *
+ * What that replaces: `service_role`, which carries BYPASSRLS and, audited
+ * 2026-09-20, could read 30 tables across 5 schemas — including
+ * `public.thoughts` (the Open Brain memory store this server's own header says
+ * it never touches), `vault.secrets`, `vault.decrypted_secrets`, and every
+ * storage bucket in the project, with full CRUD on all of it. A leak of the
+ * connector credential meant all of that, not just the wardrobe. The
+ * application code never touched any of it; the credential simply could.
+ *
+ * The `apikey` header must still be a real project API key — the Supabase
+ * gateway checks it before PostgREST is reached, and rejects an unrecognised
+ * value with "Invalid API key". It is the Authorization bearer that selects
+ * the database role. The anon key serves as gateway admission and grants
+ * nothing on its own: every wardrobe table denies it.
+ *
+ * FALLBACK, deliberate. If `WD_DB_TOKEN` is unset the function reverts to the
+ * service role key. That is the one-command rollback for a bad deploy
+ * (`supabase secrets unset WD_DB_TOKEN`), and the mitigation for the standing
+ * risk that Supabase retires the legacy HS256 verification this token depends
+ * on — its signing secret is labelled "Legacy JWT secret" in the dashboard,
+ * because the project itself now signs with ES256 keys that cannot sign claims
+ * of our choosing. If that day comes, database calls start failing and
+ * unsetting one secret restores them with no code change.
+ */
+function databaseClient(): SupabaseClient {
+  const url = Deno.env.get("SUPABASE_URL")!;
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const roleToken = Deno.env.get("WD_DB_TOKEN");
+
+  if (roleToken) {
+    // The apikey header only gets the request past the gateway; the role comes
+    // from the Authorization bearer, which is verified: with an `anon` token
+    // here the wardrobe queries fail "permission denied for table items", and
+    // with a `service_role` token they succeed, regardless of the apikey.
+    //
+    // Falling back to the service key for gateway admission is deliberate.
+    // An earlier version required SUPABASE_ANON_KEY to be present and
+    // SILENTLY reverted to a service-role client if it was missing — so a
+    // missing variable would have looked like a clean deploy while the
+    // privilege reduction quietly did not happen. Presence of WD_DB_TOKEN now
+    // decides the mode on its own, and there is no path where scoped mode is
+    // requested and service-role access is what actually runs.
+    const gatewayKey = Deno.env.get("SUPABASE_ANON_KEY") ?? serviceKey;
+    return createClient(url, gatewayKey, {
+      auth: { autoRefreshToken: false, persistSession: false },
+      global: { headers: { Authorization: `Bearer ${roleToken}` } },
+    });
+  }
+
+  return createClient(url, serviceKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+}
+
 // --- Hono app: auth + CORS + transport -----------------------------------
 
 const corsHeaders = {
@@ -2809,11 +2870,7 @@ app.all("*", async (c) => {
     Object.defineProperty(c.req, "raw", { value: patched, writable: true });
   }
 
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    { auth: { autoRefreshToken: false, persistSession: false } },
-  );
+  const supabase = databaseClient();
 
   const server = buildServer(supabase);
   const transport = new StreamableHTTPTransport({
