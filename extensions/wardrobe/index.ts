@@ -62,7 +62,16 @@ function ok(payload: unknown) {
 }
 
 const ITEM_COLUMNS =
-  "id, name, category, subcategory, brand, color, color_family, fabric, weight, seasons, register, formality, size, fit_notes, condition, status, acquired_on, acquired_from, price_paid, retired_on, pairing_notes, notes, created_at, updated_at";
+  "id, name, category, subcategory, brand, color, color_family, fabric, weight, seasons, register, formality, size, fit_notes, condition, status, acquired_on, acquired_from, price_paid, retired_on, pairing_notes, notes, source_url, source_captured_on, created_at, updated_at";
+
+/**
+ * The same list plus `source_spec` — the captured product-page markdown
+ * (composition, weight, construction, care, size chart). It is deliberately
+ * absent from ITEM_COLUMNS: a few hundred items each carrying a page of prose
+ * would make every wd_get_inventory read enormous, for text nobody filters on.
+ * Single-item reads and writes return it; list reads do not.
+ */
+const ITEM_COLUMNS_FULL = `${ITEM_COLUMNS}, source_spec`;
 
 const STATS_COLUMNS =
   "id, total_wears, last_worn, days_since_worn, wears_30d, wears_90d, total_recommendations, last_recommended_for, days_since_recommended";
@@ -215,6 +224,405 @@ function problemsPayload(
       }
       : { ref: p.ref, problem: "no_match" }
   );
+}
+
+// --- Photos --------------------------------------------------------------
+
+/**
+ * Images live in a private Supabase Storage bucket; nothing is publicly
+ * readable. Every URL handed back to a caller is minted here, with the service
+ * role, and expires.
+ */
+const PHOTO_BUCKET = "wardrobe-photos";
+const SIGNED_URL_TTL_SECONDS = 3600;
+
+const PHOTO_COLUMNS =
+  "id, item_id, event_id, kind, shot_type, storage_path, source_url, source_domain, caption, captured_on, content_hash, width_px, height_px, bytes, mime_type, color_authoritative, created_at";
+
+/** The only formats accepted, and the extension each is stored under. */
+const PHOTO_MIME_EXT: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/avif": "avif",
+};
+
+const PHOTO_MAX_BYTES = 15 * 1024 * 1024;
+const PHOTO_FETCH_TIMEOUT_MS = 10_000;
+
+/**
+ * A plain desktop browser UA. Retailer CDNs routinely 403 a bare fetch agent,
+ * and the alternative is that the as-new baseline simply never gets captured.
+ */
+const PHOTO_FETCH_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
+ * Sniff the container from magic bytes. Used when the response carries no
+ * Content-Type, or a useless one (`application/octet-stream` is common on
+ * misconfigured CDNs) — the header is a claim, the bytes are the fact.
+ */
+function sniffImageMime(b: Uint8Array): string | null {
+  if (b.length >= 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) {
+    return "image/png";
+  }
+  if (b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+    b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  // ISOBMFF: ....ftyp<brand>
+  if (
+    b.length >= 12 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70
+  ) {
+    const brand = String.fromCharCode(b[8], b[9], b[10], b[11]);
+    if (brand === "avif" || brand === "avis") return "image/avif";
+  }
+  return null;
+}
+
+type Dimensions = { width: number; height: number };
+
+const be32 = (b: Uint8Array, o: number) =>
+  ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+const be16 = (b: Uint8Array, o: number) => (b[o] << 8) | b[o + 1];
+const le16 = (b: Uint8Array, o: number) => b[o] | (b[o + 1] << 8);
+const le24 = (b: Uint8Array, o: number) => b[o] | (b[o + 1] << 8) | (b[o + 2] << 16);
+
+function pngDimensions(b: Uint8Array): Dimensions | null {
+  // IHDR is mandated to be the first chunk: width/height at fixed offsets.
+  if (b.length < 24) return null;
+  return { width: be32(b, 16), height: be32(b, 20) };
+}
+
+function jpegDimensions(b: Uint8Array): Dimensions | null {
+  // Walk the marker segments to the first Start-Of-Frame, which is the only
+  // place the dimensions are stated. Progressive JPEGs use SOF2, and a file
+  // with EXIF thumbnails has other segments in front, so this can't be a
+  // fixed offset.
+  let i = 2;
+  while (i + 9 < b.length) {
+    if (b[i] !== 0xff) { i++; continue; }
+    let marker = b[i + 1];
+    while (marker === 0xff && i + 2 < b.length) { i++; marker = b[i + 1]; }
+    // Standalone markers carry no length.
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9)) { i += 2; continue; }
+    const isSof = marker >= 0xc0 && marker <= 0xcf &&
+      marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+    if (isSof) return { height: be16(b, i + 5), width: be16(b, i + 7) };
+    const len = be16(b, i + 2);
+    if (len < 2) return null;
+    i += 2 + len;
+  }
+  return null;
+}
+
+function webpDimensions(b: Uint8Array): Dimensions | null {
+  if (b.length < 30) return null;
+  const tag = String.fromCharCode(b[12], b[13], b[14], b[15]);
+  const d = 20; // start of the first chunk's payload
+  if (tag === "VP8 ") {
+    // Lossy: 3-byte frame tag, then the 0x9D012A sync code, then 14-bit dims.
+    if (!(b[d + 3] === 0x9d && b[d + 4] === 0x01 && b[d + 5] === 0x2a)) return null;
+    return { width: le16(b, d + 6) & 0x3fff, height: le16(b, d + 8) & 0x3fff };
+  }
+  if (tag === "VP8L") {
+    if (b[d] !== 0x2f) return null;
+    const bits = b[d + 1] | (b[d + 2] << 8) | (b[d + 3] << 16) | (b[d + 4] << 24);
+    return {
+      width: (bits & 0x3fff) + 1,
+      height: ((bits >>> 14) & 0x3fff) + 1,
+    };
+  }
+  if (tag === "VP8X") {
+    // Extended (animation / alpha): canvas size, minus one, 24-bit LE.
+    return { width: le24(b, d + 4) + 1, height: le24(b, d + 7) + 1 };
+  }
+  return null;
+}
+
+function avifDimensions(b: Uint8Array): Dimensions | null {
+  // ISOBMFF proper would mean walking meta -> iprp -> ipco. Scanning for the
+  // `ispe` boxes and taking the largest gets the primary image without a box
+  // parser, and skips the embedded thumbnail, which is the only thing the
+  // shortcut could otherwise pick up.
+  let best: Dimensions | null = null;
+  for (let i = 0; i + 16 <= b.length; i++) {
+    // 'ispe', then a 4-byte version/flags word, then width and height.
+    if (b[i] !== 0x69 || b[i + 1] !== 0x73 || b[i + 2] !== 0x70 || b[i + 3] !== 0x65) {
+      continue;
+    }
+    const width = be32(b, i + 8);
+    const height = be32(b, i + 12);
+    if (!width || !height || width > 65535 || height > 65535) continue;
+    if (!best || width * height > best.width * best.height) best = { width, height };
+  }
+  return best;
+}
+
+/**
+ * Intrinsic pixel dimensions, read from the container headers. Returns null
+ * rather than guessing on an encoding it can't parse — a null reads as
+ * "not measured", where a wrong number would be taken as measured.
+ */
+function readImageDimensions(bytes: Uint8Array, mime: string): Dimensions | null {
+  try {
+    switch (mime) {
+      case "image/png":  return pngDimensions(bytes);
+      case "image/jpeg": return jpegDimensions(bytes);
+      case "image/webp": return webpDimensions(bytes);
+      case "image/avif": return avifDimensions(bytes);
+    }
+  } catch {
+    // A truncated or malformed header is a null, not a throw.
+  }
+  return null;
+}
+
+/**
+ * Shopify serves every image off one original through query parameters, and
+ * product-page markup points at a thumbnail (`?width=320&height=400&crop=center`).
+ * Storing that would defeat the whole point of an as-new baseline: 320px of a
+ * garment records nothing about weave or nap. Strip the crop and the height —
+ * height plus crop forces a fixed aspect and would letterbox the result — and
+ * ask for 2048 on the long edge.
+ *
+ * Returns null for anything that isn't Shopify: other CDNs have their own
+ * parameter grammars, and a wrong guess silently returns the wrong crop.
+ */
+function upgradeShopifyUrl(raw: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return null;
+  }
+  const host = u.hostname.toLowerCase();
+  const isShopify = host === "cdn.shopify.com" ||
+    host.endsWith(".shopifycdn.com") ||
+    host.endsWith(".myshopify.com") ||
+    u.pathname.includes("/cdn/shop/");
+  if (!isShopify) return null;
+
+  const upgraded = new URL(u.toString());
+  upgraded.searchParams.delete("height");
+  upgraded.searchParams.delete("crop");
+  upgraded.searchParams.set("width", "2048");
+  return upgraded.toString() === u.toString() ? null : upgraded.toString();
+}
+
+type FetchedImage = {
+  bytes: Uint8Array;
+  mime: string;
+  ext: string;
+  url: string;
+  width_upgraded: boolean;
+};
+
+type FetchFailure = { failed: true; message: string; url: string; status?: number };
+
+/** One attempt. No retry lives here — the caller owns the fallback policy. */
+async function fetchImageOnce(
+  url: string,
+): Promise<{ bytes: Uint8Array; mime: string } | FetchFailure> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      redirect: "follow",
+      headers: { "User-Agent": PHOTO_FETCH_UA, Accept: "image/*,*/*;q=0.8" },
+      signal: AbortSignal.timeout(PHOTO_FETCH_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    return { failed: true, url, message: `Fetch failed: ${reason}` };
+  }
+
+  if (!res.ok) {
+    await res.body?.cancel();
+    return {
+      failed: true,
+      url,
+      status: res.status,
+      message: `Fetch returned HTTP ${res.status} ${res.statusText}`.trim(),
+    };
+  }
+
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > PHOTO_MAX_BYTES) {
+    await res.body?.cancel();
+    return {
+      failed: true,
+      url,
+      status: res.status,
+      message: `Image is ${declared} bytes; the limit is ${PHOTO_MAX_BYTES}.`,
+    };
+  }
+
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.byteLength > PHOTO_MAX_BYTES) {
+    return {
+      failed: true,
+      url,
+      status: res.status,
+      message: `Image is ${bytes.byteLength} bytes; the limit is ${PHOTO_MAX_BYTES}.`,
+    };
+  }
+  if (bytes.byteLength === 0) {
+    return { failed: true, url, status: res.status, message: "Response body was empty." };
+  }
+
+  // The header is a claim; prefer it, but fall back to the bytes when it is
+  // missing or generic, and let the caller reject on the result either way.
+  const header = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  const mime = PHOTO_MIME_EXT[header] ? header : (sniffImageMime(bytes) || header || "");
+  return { bytes, mime };
+}
+
+/**
+ * Fetch an image server-side. Bytes never cross the MCP protocol: the caller
+ * supplies a URL and the function downloads it, because the MCP client has no
+ * network egress to retailer CDNs and passing binary through the protocol is
+ * wasteful.
+ *
+ * Shopify URLs are retried once at full width, then once unmodified. Nothing
+ * else is retried.
+ */
+async function fetchImageForStorage(
+  rawUrl: string,
+): Promise<FetchedImage | FetchFailure> {
+  const upgraded = upgradeShopifyUrl(rawUrl);
+  const attempts: { url: string; upgraded: boolean }[] = upgraded
+    ? [{ url: upgraded, upgraded: true }, { url: rawUrl, upgraded: false }]
+    : [{ url: rawUrl, upgraded: false }];
+
+  let lastFailure: FetchFailure | null = null;
+  for (const attempt of attempts) {
+    const res = await fetchImageOnce(attempt.url);
+    if ("failed" in res) {
+      lastFailure = res;
+      continue;
+    }
+    const ext = PHOTO_MIME_EXT[res.mime];
+    if (!ext) {
+      return {
+        failed: true,
+        url: attempt.url,
+        message: `Unsupported content type "${res.mime || "unknown"}". Accepted: ${
+          Object.keys(PHOTO_MIME_EXT).join(", ")
+        }.`,
+      };
+    }
+    return {
+      bytes: res.bytes,
+      mime: res.mime,
+      ext,
+      url: attempt.url,
+      width_upgraded: attempt.upgraded,
+    };
+  }
+  return lastFailure!;
+}
+
+function sourceDomainOf(url: string | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+type PhotoSubject =
+  | { kind: "item"; id: string; name: string }
+  | { kind: "event"; id: string; worn_on: string };
+
+/**
+ * Resolve the one subject a photo hangs off — an item or a wear event, never
+ * both. `item_ref` accepts a UUID or a case-insensitive name substring and is
+ * resolved exactly the way wd_log_wear resolves its refs: on an ambiguous or
+ * missing ref the candidates come back and NOTHING is written.
+ */
+async function resolvePhotoSubject(
+  supabase: SupabaseClient,
+  itemRef?: string,
+  eventId?: string,
+): Promise<{ subject: PhotoSubject } | { error: ReturnType<typeof ok> }> {
+  if (itemRef && eventId) {
+    return {
+      error: ok({
+        success: false,
+        message: "Provide exactly one subject: item_ref or event_id, not both.",
+      }),
+    };
+  }
+  if (!itemRef && !eventId) {
+    return {
+      error: ok({
+        success: false,
+        message: "Provide a subject: item_ref (UUID or name substring) or event_id.",
+      }),
+    };
+  }
+
+  if (itemRef) {
+    const res = await resolveItemRef(supabase, itemRef);
+    if (res.status === "ok") {
+      return { subject: { kind: "item", id: res.item.id, name: res.item.name } };
+    }
+    return {
+      error: ok({
+        success: false,
+        message: res.status === "ambiguous"
+          ? `Ambiguous item reference "${itemRef}" — nothing was written. Specify the UUID.`
+          : `No item matched "${itemRef}" — nothing was written.`,
+        unresolved: problemsPayload([res]),
+      }),
+    };
+  }
+
+  if (!isUuid(eventId!)) {
+    return {
+      error: ok({ success: false, message: `event_id must be a UUID; got "${eventId}".` }),
+    };
+  }
+  const { data, error } = await supabase
+    .from("wear_events")
+    .select("id, worn_on")
+    .eq("id", eventId!)
+    .maybeSingle();
+  if (error) throw new Error(`Lookup failed for event ${eventId}: ${error.message}`);
+  if (!data) {
+    return {
+      error: ok({ success: false, message: `No wear event with id ${eventId}.` }),
+    };
+  }
+  return { subject: { kind: "event", id: data.id, worn_on: data.worn_on } };
+}
+
+/** Mint short-lived signed URLs for a batch of object keys, keyed by path. */
+async function signPhotoPaths(
+  supabase: SupabaseClient,
+  paths: string[],
+): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  if (paths.length === 0) return out;
+  const { data, error } = await supabase.storage
+    .from(PHOTO_BUCKET)
+    .createSignedUrls(paths, SIGNED_URL_TTL_SECONDS);
+  if (error) throw new Error(`Failed to sign photo URLs: ${error.message}`);
+  for (const row of data || []) out.set(row.path ?? "", row.signedUrl ?? null);
+  return out;
 }
 
 // --- Rotation eligibility ------------------------------------------------
@@ -682,7 +1090,7 @@ function buildServer(supabase: SupabaseClient): McpServer {
 
   server.tool(
     "wd_add_item",
-    "Add a garment or accessory to the wardrobe inventory. Only `name` and `category` are required; supply whatever else you know. Use status 'incoming' for ordered-but-not-arrived pieces. Always confirm details with the owner before calling.",
+    "Add a garment or accessory to the wardrobe inventory. Only `name` and `category` are required; supply whatever else you know. Use status 'incoming' for ordered-but-not-arrived pieces. Always confirm details with the owner before calling. If the piece came from a product page, pass `source_url`, `source_spec` (the page's own composition / weight / construction / care / size-chart text, as markdown) and `source_captured_on` in the same call — product pages go dead, and the spec is unrecoverable once they do. Use `wd_add_photo` for the stock image.",
     {
       name: z.string().describe('Display name, e.g. "LMSM bleu de travail chore coat"'),
       category: z.string().describe("outerwear | shirt | knitwear | trousers | footwear | accessory | socks | other"),
@@ -704,6 +1112,9 @@ function buildServer(supabase: SupabaseClient): McpServer {
       price_paid: z.number().optional(),
       pairing_notes: z.string().optional().describe("known-good pairings, register cautions"),
       notes: z.string().optional(),
+      source_url: z.string().optional().describe("Product page the piece was bought from"),
+      source_spec: z.string().optional().describe("The product page's own spec text, captured as markdown: fabric composition, weight, construction bullets, care, and the garment size chart. Free text — it is read, not parsed or queried. Capture it at acquisition; product pages go dead."),
+      source_captured_on: z.string().optional().describe("YYYY-MM-DD, when the product page was captured"),
     },
     async (args) => {
       const row: Record<string, unknown> = {};
@@ -713,7 +1124,7 @@ function buildServer(supabase: SupabaseClient): McpServer {
       const { data, error } = await supabase
         .from("items")
         .insert(row)
-        .select(ITEM_COLUMNS)
+        .select(ITEM_COLUMNS_FULL)
         .single();
       if (error) throw new Error(`Failed to add item: ${error.message}`);
       return ok({ success: true, message: `Added item: ${data.name}`, item: data });
@@ -747,6 +1158,9 @@ function buildServer(supabase: SupabaseClient): McpServer {
       retired_on: z.string().optional(),
       pairing_notes: z.string().optional(),
       notes: z.string().optional(),
+      source_url: z.string().optional(),
+      source_spec: z.string().optional().describe("Captured product-page text as markdown"),
+      source_captured_on: z.string().optional().describe("YYYY-MM-DD"),
     },
     async ({ item_id, name_match, ...fields }) => {
       const id = await resolveSingleId(supabase, item_id, name_match);
@@ -764,7 +1178,7 @@ function buildServer(supabase: SupabaseClient): McpServer {
         .from("items")
         .update(updates)
         .eq("id", id.value)
-        .select(ITEM_COLUMNS)
+        .select(ITEM_COLUMNS_FULL)
         .single();
       if (error) throw new Error(`Failed to update item: ${error.message}`);
       return ok({ success: true, message: `Updated item: ${data.name}`, item: data });
@@ -1461,6 +1875,164 @@ function buildServer(supabase: SupabaseClient): McpServer {
   );
 
   server.tool(
+    "wd_add_photo",
+    "Attach a photograph to one garment (`item_ref`) or one wear event (`event_id`) — exactly one subject, never both. You supply a URL; the function fetches, hashes, measures and stores the bytes itself. Do not attempt to pass image data. `kind` is the load-bearing field and constrains what the frame may ever be read for: 'reference' = the owner's own garment shot under controlled light with a colour chart in frame — the ONLY kind from which colour values may be taken; 'outfit' = the owner's garment as worn, a mirror snap — good for fit over time and for settling what was actually worn, NEVER for colour values; 'stock' = the maker's or retailer's own photography — good for identification, for the as-new baseline (original indigo depth, suede nap, knit surface before wear), and for construction detail, but NEVER for colour values, fit, or proportion, because retailers grade images for appeal and a stock photo is the most authoritative-looking and least colour-faithful image in the archive. `color_authoritative` is generated by the database from `kind` and cannot be set here. Re-adding the same bytes for the same item returns the existing photo instead of duplicating. If the item reference is ambiguous or unmatched, candidates are returned and nothing is written.",
+    {
+      item_ref: z.string().optional().describe("Subject garment: item UUID or a case-insensitive name substring (resolved as in wd_log_wear). Mutually exclusive with event_id."),
+      event_id: z.string().optional().describe("Subject wear event UUID. Mutually exclusive with item_ref."),
+      kind: z.enum(["stock", "reference", "outfit"]).describe("stock = retailer photography: identification, as-new baseline, construction detail; never colour, fit or proportion. reference = owner's garment, controlled light, colour chart in frame: the only colour-authoritative kind. outfit = owner's garment as worn, mirror snap: fit over time and provenance; never colour."),
+      source_url: z.string().describe("URL of the image to fetch server-side. Required for every kind: fetching this URL is the only way bytes enter the bucket in this build (phone-photo ingest is deliberately out of scope), and for kind 'stock' it doubles as the provenance record — a baseline with no source is not a baseline. A Shopify thumbnail URL is fine; the width parameter is raised before fetching."),
+      shot_type: z.enum(["flatlay", "on_model", "detail", "swatch", "full_length", "other"]).optional().describe("flatlay | on_model | detail | swatch | full_length | other"),
+      caption: z.string().optional().describe("What the frame shows, in the owner's words"),
+      captured_on: z.string().optional().describe("YYYY-MM-DD, when the photograph was taken (not when it was ingested). Stored as a literal date."),
+    },
+    async ({ item_ref, event_id, kind, source_url, shot_type, caption, captured_on }) => {
+      const subjectRes = await resolvePhotoSubject(supabase, item_ref, event_id);
+      if ("error" in subjectRes) return subjectRes.error;
+      const subject = subjectRes.subject;
+
+      const fetched = await fetchImageForStorage(source_url);
+      if ("failed" in fetched) {
+        return ok({
+          success: false,
+          message: `${fetched.message} Nothing was written.`,
+          url: fetched.url,
+          http_status: fetched.status ?? null,
+        });
+      }
+
+      const content_hash = await sha256Hex(fetched.bytes);
+
+      // Same bytes, same garment: return what is already there. The unique
+      // index backstops this, but catching it here keeps the storage object
+      // from being uploaded twice.
+      if (subject.kind === "item") {
+        const { data: dupe, error: dupeErr } = await supabase
+          .from("photos")
+          .select(PHOTO_COLUMNS)
+          .eq("item_id", subject.id)
+          .eq("content_hash", content_hash)
+          .maybeSingle();
+        if (dupeErr) throw new Error(`Duplicate check failed: ${dupeErr.message}`);
+        if (dupe) {
+          const signed = await signPhotoPaths(supabase, [dupe.storage_path]);
+          return ok({
+            success: true,
+            already_stored: true,
+            message: `These exact bytes are already stored for "${subject.name}" — no second row was created.`,
+            photo: { ...dupe, photo_id: dupe.id, signed_url: signed.get(dupe.storage_path) ?? null },
+          });
+        }
+      }
+
+      const dims = readImageDimensions(fetched.bytes, fetched.mime);
+      const photoId = crypto.randomUUID();
+      const storage_path = `${kind}/${subject.id}/${photoId}.${fetched.ext}`;
+
+      const { error: uploadErr } = await supabase.storage
+        .from(PHOTO_BUCKET)
+        .upload(storage_path, fetched.bytes, {
+          contentType: fetched.mime,
+          upsert: false,
+        });
+      if (uploadErr) throw new Error(`Failed to upload photo: ${uploadErr.message}`);
+
+      const row: Record<string, unknown> = {
+        id: photoId,
+        kind,
+        storage_path,
+        content_hash,
+        mime_type: fetched.mime,
+        bytes: fetched.bytes.byteLength,
+        width_px: dims?.width ?? null,
+        height_px: dims?.height ?? null,
+        source_url: source_url,
+        source_domain: sourceDomainOf(source_url),
+      };
+      if (subject.kind === "item") row.item_id = subject.id;
+      else row.event_id = subject.id;
+      if (shot_type) row.shot_type = shot_type;
+      if (caption) row.caption = caption;
+      if (captured_on) row.captured_on = captured_on;
+
+      const { data, error } = await supabase
+        .from("photos")
+        .insert(row)
+        .select(PHOTO_COLUMNS)
+        .single();
+      if (error) {
+        // Roll the object back so a failed insert doesn't leave bytes in the
+        // bucket that nothing references.
+        await supabase.storage.from(PHOTO_BUCKET).remove([storage_path]);
+        throw new Error(`Failed to record photo: ${error.message}`);
+      }
+
+      const signed = await signPhotoPaths(supabase, [storage_path]);
+      const subjectLabel = subject.kind === "item"
+        ? `"${subject.name}"`
+        : `wear event ${subject.worn_on}`;
+
+      return ok({
+        success: true,
+        already_stored: false,
+        message: `Stored a ${kind} photo for ${subjectLabel}${
+          dims ? ` at ${dims.width}x${dims.height}` : ""
+        }.${fetched.width_upgraded ? " Shopify URL was raised to width=2048 before fetching." : ""}${
+          data.color_authoritative
+            ? " This frame IS colour-authoritative."
+            : " This frame is NOT colour-authoritative — do not read colour values off it."
+        }`,
+        photo: { ...data, photo_id: data.id, signed_url: signed.get(storage_path) ?? null },
+        fetched_url: fetched.url,
+        width_upgraded: fetched.width_upgraded,
+      });
+    },
+  );
+
+  server.tool(
+    "wd_delete_photo",
+    "Delete one photograph by `photo_id`: removes both the database row and the stored object. The row goes first, so a storage failure leaves an unreferenced object rather than a row pointing at bytes that are gone — the result reports which happened. Returns the deleted id, its subject, and its storage path.",
+    {
+      photo_id: z.string().describe("Photo UUID"),
+    },
+    async ({ photo_id }) => {
+      if (!isUuid(photo_id)) {
+        return ok({ success: false, message: `photo_id must be a UUID; got "${photo_id}".` });
+      }
+
+      const { data: existing, error: readErr } = await supabase
+        .from("photos")
+        .select(PHOTO_COLUMNS)
+        .eq("id", photo_id)
+        .maybeSingle();
+      if (readErr) throw new Error(`Failed to read photo: ${readErr.message}`);
+      if (!existing) {
+        return ok({ success: false, message: `No photo with id ${photo_id}.` });
+      }
+
+      const { error: delErr } = await supabase.from("photos").delete().eq("id", photo_id);
+      if (delErr) throw new Error(`Failed to delete photo row: ${delErr.message}`);
+
+      const { error: objErr } = await supabase.storage
+        .from(PHOTO_BUCKET)
+        .remove([existing.storage_path]);
+
+      return ok({
+        success: true,
+        message: objErr
+          ? `Deleted photo ${photo_id}, but the stored object could not be removed: ${objErr.message}`
+          : `Deleted photo ${photo_id} and its stored object.`,
+        photo_id,
+        subject: existing.item_id
+          ? { kind: "item", id: existing.item_id }
+          : { kind: "event", id: existing.event_id },
+        storage_path: existing.storage_path,
+        storage_object_deleted: !objErr,
+      });
+    },
+  );
+
+  server.tool(
     "wd_mark_review_done",
     "Mark a rotation review as completed today. Sets system_state.last_rotation_review to today's date. Call this at the end of a rotation-review conversation.",
     {
@@ -1529,7 +2101,7 @@ function buildServer(supabase: SupabaseClient): McpServer {
 
   server.tool(
     "wd_get_item",
-    "Get the full record for one item plus its wear statistics (total wears, last worn, days since worn, wears in last 30/90 days) and its recommendation recency. Reference by `item_id` or unambiguous `name_match`. `total_wears` is the authoritative wear count for an item. Claims that an item has never been worn, or is on its first wear, must be sourced from this field. Do not infer wear history from `condition`, `acquired_on`, `fit_notes`, or prose in `notes` — those fields are frequently stale and are not wear data. These numbers come from the same view that backs `wd_get_inventory`, so the two tools always agree.",
+    "Get the full record for one item plus its wear statistics (total wears, last worn, days since worn, wears in last 30/90 days) and its recommendation recency. Reference by `item_id` or unambiguous `name_match`. `total_wears` is the authoritative wear count for an item. Claims that an item has never been worn, or is on its first wear, must be sourced from this field. Do not infer wear history from `condition`, `acquired_on`, `fit_notes`, or prose in `notes` — those fields are frequently stale and are not wear data. These numbers come from the same view that backs `wd_get_inventory`, so the two tools always agree. Also returns `source_spec` — the captured product-page text, which the list read omits — and `photo_count`, broken out by kind. Call `wd_get_photos` for the frames themselves; only a `reference` frame may be read for colour.",
     {
       item_id: z.string().optional().describe("Item UUID"),
       name_match: z.string().optional().describe("Case-insensitive substring of the item name; must be unambiguous"),
@@ -1538,14 +2110,26 @@ function buildServer(supabase: SupabaseClient): McpServer {
       const id = await resolveSingleId(supabase, item_id, name_match);
       if ("error" in id) return id.error;
 
-      const [itemRes, statsRes] = await Promise.all([
-        supabase.from("items").select(ITEM_COLUMNS).eq("id", id.value).single(),
+      const [itemRes, statsRes, photoRes] = await Promise.all([
+        supabase.from("items").select(ITEM_COLUMNS_FULL).eq("id", id.value).single(),
         supabase.from("v_item_stats").select(STATS_COLUMNS).eq("id", id.value).maybeSingle(),
+        supabase.from("photos").select("kind").eq("item_id", id.value),
       ]);
       if (itemRes.error) throw new Error(`Failed to get item: ${itemRes.error.message}`);
       if (statsRes.error) throw new Error(`Failed to get item stats: ${statsRes.error.message}`);
+      if (photoRes.error) throw new Error(`Failed to count photos: ${photoRes.error.message}`);
 
       const stats = normalizeStats(statsRes.data);
+
+      // Counts only. Signed URLs are minted on request by wd_get_photos —
+      // putting them here would attach an expiring credential to every read.
+      const photoRows = (photoRes.data || []) as { kind: string }[];
+      const photo_count = {
+        total: photoRows.length,
+        stock: photoRows.filter((p) => p.kind === "stock").length,
+        reference: photoRows.filter((p) => p.kind === "reference").length,
+        outfit: photoRows.filter((p) => p.kind === "outfit").length,
+      };
       return ok({
         success: true,
         item: itemRes.data,
@@ -1566,6 +2150,52 @@ function buildServer(supabase: SupabaseClient): McpServer {
           last_recommended_for: stats.last_recommended_for,
           days_since_recommended: stats.days_since_recommended,
         },
+        photo_count,
+      });
+    },
+  );
+
+  server.tool(
+    "wd_get_photos",
+    "List the photographs attached to one garment (`item_ref`) or one wear event (`event_id`), each with a freshly signed URL valid for one hour. Ordered by `kind`, then oldest first. Every row carries `color_authoritative` explicitly: it is true only for `kind: 'reference'` (the owner's garment under controlled light with a colour chart in frame). Colour values may be read ONLY from a frame where it is true. A `stock` frame is retailer photography graded for appeal — it is the most authoritative-looking and least colour-faithful image here, and is for identification, as-new baseline and construction detail only, never colour, fit or proportion. An `outfit` frame is a mirror snap: fit and provenance, never colour.",
+    {
+      item_ref: z.string().optional().describe("Item UUID or case-insensitive name substring. Mutually exclusive with event_id."),
+      event_id: z.string().optional().describe("Wear event UUID. Mutually exclusive with item_ref."),
+      kind: z.enum(["stock", "reference", "outfit"]).optional().describe("Filter to one kind"),
+      shot_type: z.enum(["flatlay", "on_model", "detail", "swatch", "full_length", "other"]).optional().describe("Filter to one shot type"),
+    },
+    async ({ item_ref, event_id, kind, shot_type }) => {
+      const subjectRes = await resolvePhotoSubject(supabase, item_ref, event_id);
+      if ("error" in subjectRes) return subjectRes.error;
+      const subject = subjectRes.subject;
+
+      let q = supabase.from("photos").select(PHOTO_COLUMNS);
+      q = subject.kind === "item"
+        ? q.eq("item_id", subject.id)
+        : q.eq("event_id", subject.id);
+      if (kind) q = q.eq("kind", kind);
+      if (shot_type) q = q.eq("shot_type", shot_type);
+      q = q.order("kind", { ascending: true }).order("created_at", { ascending: true });
+
+      const { data, error } = await q;
+      if (error) throw new Error(`Failed to list photos: ${error.message}`);
+
+      const rows = data || [];
+      const signed = await signPhotoPaths(supabase, rows.map((r) => r.storage_path));
+      const photos = rows.map((r) => ({
+        ...r,
+        photo_id: r.id,
+        signed_url: signed.get(r.storage_path) ?? null,
+      }));
+
+      return ok({
+        success: true,
+        subject: subject.kind === "item"
+          ? { kind: "item", id: subject.id, name: subject.name }
+          : { kind: "event", id: subject.id, worn_on: subject.worn_on },
+        count: photos.length,
+        color_authoritative_count: photos.filter((p) => p.color_authoritative).length,
+        photos,
       });
     },
   );
@@ -1955,6 +2585,45 @@ function unauthorizedResponse(id: string | number | null): Response {
 const app = new Hono();
 
 app.options("*", (c) => c.text("ok", 200, corsHeaders));
+
+/**
+ * OAuth discovery probes must 404.
+ *
+ * This server does not use OAuth. It authenticates with a shared key, passed
+ * as `?key=` or the `x-access-key` / `x-brain-key` header. But a connector
+ * client doesn't know that until it asks: before falling back to an
+ * unauthenticated connection it probes for OAuth metadata (RFC 8414 / RFC
+ * 9728) and, if it finds any, for a dynamic client registration endpoint.
+ *
+ * The catch-all health GET below answers EVERY path with HTTP 200 and a
+ * health document. To a probing client, 200 on
+ * `/.well-known/oauth-authorization-server` reads as "yes, this resource is
+ * OAuth-protected, and this is its metadata" — so it stops considering the
+ * no-auth path, then fails to register a client against a document that has
+ * no `registration_endpoint`, and surfaces "couldn't register with the
+ * sign-in service". The server looked like it had a broken OAuth setup rather
+ * than no OAuth at all.
+ *
+ * 404 is the correct and required signal here: there is no authorization
+ * server, use the key. This must stay ahead of the catch-all.
+ */
+const OAUTH_PROBE_PATH_RE =
+  /\/\.well-known\/(oauth-authorization-server|oauth-protected-resource|openid-configuration)|\/register$/;
+
+app.use("*", async (c, next) => {
+  if (OAUTH_PROBE_PATH_RE.test(new URL(c.req.url).pathname)) {
+    return c.json(
+      {
+        error: "not_found",
+        message:
+          "This server does not use OAuth. Authenticate with the access key: append ?key=<MCP_ACCESS_KEY> to the connector URL, or send it as the x-access-key header.",
+      },
+      404,
+      corsHeaders,
+    );
+  }
+  await next();
+});
 
 // Lightweight health check (no auth, no body) for GET pings.
 app.get("*", (c) => {

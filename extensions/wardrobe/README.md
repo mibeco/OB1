@@ -62,7 +62,13 @@ Run the SQL in `schema.sql` against your existing project — Supabase SQL Edito
 supabase db query --linked -f extensions/wardrobe/schema.sql
 ```
 
-This creates the tables (`items`, `wear_events`, `wear_event_items`, `outfits`, `outfit_items`, `system_state`), the analytics views, the `updated_at` triggers, and seeds the `last_rotation_review` state row. There is **no RLS** — this is a single-owner system. It does not touch your `thoughts` table.
+This creates the tables (`items`, `wear_events`, `wear_event_items`, `outfits`, `outfit_items`, `photos`, `system_state`), the analytics views, the `updated_at` triggers, the private `wardrobe-photos` storage bucket, and seeds the `last_rotation_review` state row. It does not touch your `thoughts` table.
+
+If you built this before the photo layer existed, apply the migration instead of re-running the whole schema:
+
+```bash
+supabase db query --linked -f extensions/wardrobe/migrations/005_photos.sql
+```
 
 ### 2. Deploy the MCP Server
 
@@ -100,11 +106,11 @@ Tell your agent about what you own, in plain language, and let it draft `wd_add_
 
 ## Available Tools
 
-All tools use the `wd_` prefix and return JSON. Item references accept either `item_id` (UUID) or `name_match` (case-insensitive substring); on an ambiguous name, the tool returns the candidates instead of guessing.
+All tools use the `wd_` prefix and return JSON. Item references accept either `item_id` (UUID) or `name_match` (case-insensitive substring); on an ambiguous name, the tool returns the candidates instead of guessing. The photo tools take a single `item_ref` that accepts either form, resolved the same way `wd_log_wear` resolves the refs in `item_refs`.
 
 **Writes**
 
-1. **`wd_add_item`** — Add a garment/accessory. Required: `name`, `category`. Everything else optional. Use `status: "incoming"` for ordered-not-arrived.
+1. **`wd_add_item`** — Add a garment/accessory. Required: `name`, `category`. Everything else optional. Use `status: "incoming"` for ordered-not-arrived. Also takes `source_url`, `source_spec` and `source_captured_on`, so a record and its provenance land in one write — see **Photographs and product-page capture** below.
 2. **`wd_update_item`** — Partial update by id or unambiguous name. Fit notes, condition, pairing notes, status changes.
 3. **`wd_retire_item`** — Convenience: sets `status: "retired"`, records `retired_on`, appends a reason to notes.
 4. **`wd_log_wear`** — Log an outfit-of-the-day: one wear event + links to every item worn. Resolves **all** refs before writing; on any unresolved ref it logs nothing and returns the problems. `worn_on` defaults to today in America/Los_Angeles. Carries `register_note` and `paradigm_note` (see below).
@@ -114,21 +120,42 @@ All tools use the `wd_` prefix and return JSON. Item references accept either `i
 8. **`wd_update_recommendation`** — Close the loop by `recommendation_id`: set `outcome` (`worn_as_proposed` | `worn_with_deviation` | `declined` | `superseded` | `unknown`), `chosen_option_id` (validated against this recommendation's options), `wear_event_id`, and `deviation_notes` — the what-he-swapped-and-why signal. Options/items can't be edited; delete and re-log instead.
 9. **`wd_delete_recommendation`** — Delete a recommendation with its options and item links by `recommendation_id`.
 10. **`wd_save_outfit`** — Persist a named, reusable combination with register, notes, `register_note` and `paradigm_note`.
-11. **`wd_mark_review_done`** — Sets `last_rotation_review` to today. Call at the end of a rotation review.
+11. **`wd_add_photo`** — Attach a photograph to one item (`item_ref`) or one wear event (`event_id`). You pass a URL; the **function fetches the bytes server-side** — image data never crosses the MCP protocol. Shopify thumbnail URLs are raised to `width=2048` (and the `height`/`crop` params dropped) before fetching. Deduplicates on sha256 per item. `kind` is required and governs what the frame may be read for; see below.
+12. **`wd_delete_photo`** — Delete one photo by `photo_id`: removes the row and the stored object, and reports whether each went.
+13. **`wd_mark_review_done`** — Sets `last_rotation_review` to today. Call at the end of a rotation review.
 
 **Reads**
 
-12. **`wd_get_inventory`** — List items with filters: `category`, `register`, `status`, `color_family`, `season`, `weight`. Excludes retired unless asked.
-13. **`wd_get_item`** — Full record for one item plus its wear stats (total/last/30d/90d).
-14. **`wd_wear_history`** — Wear events filtered by date range, item, context, or audience tag. Answers "when did I last wear X around Y."
-15. **`wd_recommendation_history`** — Recommendations (newest first by `recommended_for`) with their options, items, `outcome`, `deviation_notes`, and `chosen_option_id`; filter by date range, item, outcome, audience, or context. Each item carries `days_since_recommended` — the exclusion step before proposing anything new.
-16. **`wd_eligibility`** — Deterministic 7-day rotation eligibility for a date (see the note below). Returns every governed item in exactly one bucket — `blocked_worn`, `boundary`, `config_flag`, `eligible` — plus `exempt` for requested non-governed categories, `never_worn` / `never_recommended` name lists, and a signed `run_id`.
-17. **`wd_rotation_report`** — Dormant (unworn ≥ N days, default 60), over-worn (≥ M wears in 30 days, default 6), and `under_review` items, plus `last_rotation_review` and `days_since_review`. N and M overridable.
-18. **`wd_get_outfits`** — Saved outfits, optionally filtered by register or by containing item.
+14. **`wd_get_inventory`** — List items with filters: `category`, `register`, `status`, `color_family`, `season`, `weight`. Excludes retired unless asked.
+15. **`wd_get_item`** — Full record for one item plus its wear stats (total/last/30d/90d), its `source_spec`, and `photo_count` broken out by kind.
+16. **`wd_get_photos`** — The photos on one item or wear event, each with a freshly signed URL (1 hour). Ordered by `kind`, then oldest first. Every row states `color_authoritative` explicitly.
+17. **`wd_wear_history`** — Wear events filtered by date range, item, context, or audience tag. Answers "when did I last wear X around Y."
+18. **`wd_recommendation_history`** — Recommendations (newest first by `recommended_for`) with their options, items, `outcome`, `deviation_notes`, and `chosen_option_id`; filter by date range, item, outcome, audience, or context. Each item carries `days_since_recommended` — the exclusion step before proposing anything new.
+19. **`wd_eligibility`** — Deterministic 7-day rotation eligibility for a date (see the note below). Returns every governed item in exactly one bucket — `blocked_worn`, `boundary`, `config_flag`, `eligible` — plus `exempt` for requested non-governed categories, `never_worn` / `never_recommended` name lists, and a signed `run_id`.
+20. **`wd_rotation_report`** — Dormant (unworn ≥ N days, default 60), over-worn (≥ M wears in 30 days, default 6), and `under_review` items, plus `last_rotation_review` and `days_since_review`. N and M overridable.
+21. **`wd_get_outfits`** — Saved outfits, optionally filtered by register or by containing item.
 
 > **Register and paradigm tags.** Every formulated outfit — each recommendation option, each saved outfit, each wear event — carries two free-text fields: `register_note` (your own register system, which bundles lineage with a formality band) and `paradigm_note` (Simon Crompton's lineage-only taxonomy from *Five paradigms of casual clothing*, Permanent Style, 2018: British country, American prep, Italian smooth, Workwear, Sportswear). They are prose rather than enums on purpose: the interesting outfits are mixed, and a note can say "Workwear throughout; Italian smooth at the knit; deliberate collision at the footwear" where a category could not. The agent should fill both every time. Added in `migrations/003_register_paradigm_notes.sql`.
 
 > **Rotation eligibility.** The 7-day recency rule — *never recommend the same shirt, sock, or tee within a rolling 7 days; recommended-but-unworn suppresses re-proposing the same configuration, not the item, and never applies to an under-rotation item* — is computed in one place in the edge function and never by the agent. `wd_eligibility(for_date)` evaluates every active item in `shirt`, `tee`, `socks`, and `knitwear` (knitwear is governed only where the subcategory is a tee / t-shirt / tank — loopwheel tees are catalogued there; sweaters, hoodies, henleys and vests come back `exempt`). Buckets, first match wins: `blocked_worn` (worn 0–6 days before `for_date`), `boundary` (exactly 7 — eligible, flagged), `config_flag` (an unworn recommendation 0–6 days before — the item is eligible, that configuration is not; the other items from that option are attached), `eligible`, `exempt`. `under_rotation` (no logged wear, or unworn ≥ `dormancy_days`, default 30) never lands in `config_flag`. `never_worn` and `never_recommended` are surfaced as name lists so a null is never something the reader has to notice. The response's `run_id` is a stateless HMAC token (`WD_ELIGIBILITY_SECRET`) over `{for_date, computed_at}`; `wd_log_recommendation` requires it, checks signature, date and age (30 minutes), then recomputes eligibility at write time and refuses the whole call (`blocked_items`) if any option contains a blocked item. `boundary` and `config_flag` items are written but returned in `warnings`. The token is stored on the row as a receipt (`migrations/004_eligibility_run_id.sql`).
+
+> **Photographs and product-page capture.** Images live in a **private** `wardrobe-photos` bucket; nothing is publicly readable, and every URL handed back is a service-role signed URL that expires after an hour. Bytes never cross the MCP protocol — `wd_add_photo` takes a URL and the edge function does the fetch, because the MCP client has no egress to retailer CDNs and passing binary through the protocol is wasteful. Accepted: JPEG, PNG, WebP, AVIF, up to 15 MB, 10s timeout, one retry at most.
+>
+> `kind` is the load-bearing field, and the reason this table exists rather than a bare image column:
+>
+> | kind | subject | valid for | never |
+> |---|---|---|---|
+> | `reference` | your garment, colour chart in frame, controlled light | colour measurement | — |
+> | `outfit` | your garment as worn (mirror snap) | fit over time, provenance | colour values |
+> | `stock` | the maker's garment, retailer photography | identification, as-new baseline, construction detail | colour values, fit, proportion |
+>
+> The hazard being encoded: a stock photo *looks* more authoritative than anything else in the archive — studio light, clean background — and is simultaneously the least reliable image in it for colour, because retailers grade for appeal. Highest apparent quality, lowest actual fidelity. So `photos.color_authoritative` is a **generated** column (`kind = 'reference'`), not a flag a handler can set; any future colour pipeline must filter on it. Every `wd_get_photos` row states it explicitly.
+>
+> Why bother at all: a stock image is **t=0** for a garment — the only record of original indigo depth, suede nap or knit surface before wear, available at acquisition and unrecoverable afterwards. It is also the fastest way to disambiguate three similar stone-coloured bottoms, which is the most common friction in this system.
+>
+> Alongside the images, `items` carries `source_url`, `source_spec` and `source_captured_on`. `source_spec` is the product page's own text as markdown — composition, weight, construction bullets, care, size chart. Free text: read by humans and by the advisor, never parsed or queried. It is returned by `wd_get_item` but deliberately **not** by `wd_get_inventory`, so a full catalogue read doesn't carry a page of prose per garment.
+>
+> **Phone-photo ingest is deliberately out of scope.** Getting mirror snaps off a phone into the bucket is an unsolved design question, not a schema question. The `outfit` kind exists so the path stays open; nothing here populates it automatically. Added in `migrations/005_photos.sql`.
 
 > **Note on qualitative notes.** There is intentionally no `wd_get_style_notes` tool and no `style_notes` table. Style identity, registers, principles, and person notes live in the base Open Brain `thoughts` store — capture them with `capture_thought` and retrieve them with `search_thoughts`. This keeps the structured wardrobe data and the qualitative wiki cleanly separated, and makes your style profile available to every connected AI, not just this extension.
 
@@ -155,12 +182,17 @@ After completing this extension, your agent can:
 4. Save and recall outfits that are known to work
 5. Run a rotation report — what's gone dormant, what's over-worn, how overdue the review is
 6. Recommend outfits grounded in inventory, wear history, weather, calendar, and your style profile
+7. Keep an as-new baseline image and the captured product-page spec for every garment, with the colour-authority rule enforced by the database rather than by anyone's memory
 
 ## Troubleshooting
 
 For common issues (connection errors, 401s, deployment problems), see [Common Troubleshooting](../../primitives/troubleshooting/).
 
 **Extension-specific issues:**
+
+**Adding the connector fails with "Couldn't register with <name>'s sign-in service"**
+- The client probed for OAuth metadata and thought it found some. This server has no OAuth — it authenticates with `MCP_ACCESS_KEY` in the URL — so the `/.well-known/oauth-*` paths must return **404**, not the health document. The catch-all `app.get("*")` health route will answer them with HTTP 200 unless the probe handler above it catches them first; a 200 there reads as "this resource is OAuth-protected", and registration then fails against a document with no `registration_endpoint`. If you hit this, check that handler is present and deployed. Then re-add the connector with the key in the URL: `https://<ref>.supabase.co/functions/v1/wardrobe-mcp?key=<MCP_ACCESS_KEY>`.
+- An existing connector won't show this, because discovery only runs when one is added. Deleting and re-adding is what exposes it.
 
 **`wd_log_wear` returns `success: false` with an `unresolved` list**
 - This is by design — it resolves every item before writing so you never half-log an outfit. Fix the listed refs (use the returned candidate UUIDs for ambiguous names, or add the missing item first) and call again.

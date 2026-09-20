@@ -29,6 +29,9 @@ create table items (
   retired_on      date,
   pairing_notes   text,                          -- known-good pairings, register cautions
   notes           text,
+  source_url      text,                          -- product page the piece was bought from
+  source_spec     text,                          -- captured product-page text as markdown: composition, weight, construction, care, size chart. Free text, not parsed, not queried.
+  source_captured_on date,                       -- when that capture was taken
   created_at      timestamptz default now(),
   updated_at      timestamptz default now()
 );
@@ -142,6 +145,77 @@ create index roi_item_idx on recommendation_option_items (item_id);
 grant select, insert, update, delete on table public.recommendations to service_role;
 grant select, insert, update, delete on table public.recommendation_options to service_role;
 grant select, insert, update, delete on table public.recommendation_option_items to service_role;
+
+-- ---------------------------------------------------------------------------
+-- PHOTOS: images of garments, in the private `wardrobe-photos` bucket.
+--
+-- `kind` is load-bearing and governs what a frame may be read for:
+--
+--   reference  owner's garment, colour chart in frame, controlled light
+--              -> colour measurement. The only colour-authoritative kind.
+--   outfit     owner's garment as worn (mirror snap)
+--              -> fit over time, provenance. Never colour values.
+--   stock      maker's garment, retailer photography
+--              -> identification, as-new baseline, construction detail.
+--                 Never colour values, fit, or proportion.
+--
+-- The hazard this encodes: a stock photo looks more authoritative than
+-- anything else in the archive — studio light, clean background — and is
+-- simultaneously the least reliable image in it for colour, because retailers
+-- grade for appeal. `color_authoritative` is GENERATED from `kind` so no
+-- handler can set it, and any future colour pipeline must filter on it.
+--
+-- Bytes never pass through the MCP protocol: the caller supplies a URL and the
+-- edge function fetches, hashes, measures and uploads server-side. See
+-- migrations/005_photos.sql.
+-- ---------------------------------------------------------------------------
+create table photos (
+  id                  uuid primary key default gen_random_uuid(),
+  item_id             uuid references items(id) on delete cascade,
+  event_id            uuid references wear_events(id) on delete cascade,
+
+  kind                text not null
+                        check (kind in ('stock','reference','outfit')),
+  shot_type           text
+                        check (shot_type in ('flatlay','on_model','detail','swatch','full_length','other')),
+
+  storage_path        text not null,             -- {kind}/{item_id or event_id}/{photo id}.{ext}
+  source_url          text,
+  source_domain       text,
+  caption             text,
+  captured_on         date,
+
+  content_hash        text,                      -- sha256 of the stored bytes
+  width_px            integer,
+  height_px           integer,
+  bytes               integer,
+  mime_type           text,
+
+  color_authoritative boolean generated always as (kind = 'reference') stored,
+
+  created_at          timestamptz not null default now(),
+
+  constraint photos_subject_present
+    check (item_id is not null or event_id is not null)
+);
+
+create index photos_item_idx  on photos(item_id);
+create index photos_event_idx on photos(event_id);
+
+-- Same bytes, same garment, one row. Partial because `item_id` is nullable for
+-- event-subject photos and NULLs do not collide.
+create unique index photos_hash_item_uniq
+  on photos(item_id, content_hash) where item_id is not null;
+
+alter table photos enable row level security;  -- no policies; service role only
+
+grant select, insert, update, delete on table public.photos to service_role;
+
+-- Private bucket. No public read; the edge function mints signed URLs with the
+-- service role on request (default TTL 1 hour).
+insert into storage.buckets (id, name, public)
+values ('wardrobe-photos', 'wardrobe-photos', false)
+on conflict (id) do nothing;
 
 -- ---------------------------------------------------------------------------
 -- QUALITATIVE / WIKI LAYER: not a table here.
