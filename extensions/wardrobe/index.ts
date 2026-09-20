@@ -2626,35 +2626,95 @@ app.use("*", async (c, next) => {
 });
 
 // Lightweight health check (no auth, no body) for GET pings.
+//
+// It deliberately reports liveness only. It used to return an `authenticated`
+// boolean, which meant an unauthenticated GET answered HTTP 200 with a body
+// stating `"authenticated": false` — a connector probing to decide whether the
+// server wants a sign-in reads that as "yes, it does", and then conflicts with
+// a connector configured for no sign-in. Liveness and auth state are different
+// questions; this endpoint answers the first one.
 app.get("*", (c) => {
-  const provided = c.req.query("key") ||
-    c.req.header("x-access-key") || c.req.header("x-brain-key");
-  if (!WD_ACCESS_KEY || provided !== WD_ACCESS_KEY) {
-    // Still answer GET pings without leaking auth as a transport fault.
-    return c.json({ status: "ok", service: "Wardrobe System", version: "1.0.0", authenticated: false }, 200, corsHeaders);
-  }
-  return c.json({ status: "ok", service: "Wardrobe System", version: "1.0.0", authenticated: true }, 200, corsHeaders);
+  return c.json(
+    { status: "ok", service: "Wardrobe System", version: "1.0.0" },
+    200,
+    corsHeaders,
+  );
 });
+
+/**
+ * JSON-RPC methods an UNAUTHENTICATED caller may invoke.
+ *
+ * A connector configured for "no sign-in" probes the server before it will
+ * accept that setting: it opens the MCP handshake without credentials and
+ * reads what comes back. Refusing that probe made the server look like it was
+ * demanding a sign-in it does not actually offer, and the connector refused to
+ * register ("set up as not requiring sign-in, but the server asked for sign-in
+ * when checked"). So the handshake is open and everything that touches data is
+ * not.
+ *
+ * The deliberate trade: the tool CATALOGUE — names, descriptions, argument
+ * schemas — is readable by anyone who knows the URL. No wardrobe data is:
+ * items, wear events, photos and signed URLs are reached only through
+ * `tools/call`, which still requires the key, as does anything not on this
+ * list. Keep it that way — adding `resources/read` or `prompts/get` here would
+ * turn a catalogue leak into a data leak.
+ */
+const UNAUTHENTICATED_METHODS = new Set([
+  "initialize",
+  "notifications/initialized",
+  "notifications/cancelled",
+  "ping",
+  "tools/list",
+]);
+
+/**
+ * True when every method in the payload is safe for an anonymous caller. A
+ * batch is only open if ALL of its entries are: one `tools/call` smuggled into
+ * an otherwise-innocent batch must fail the whole request. Anything
+ * unparseable is treated as closed.
+ */
+function isUnauthenticatedRequest(bodyText: string | null): boolean {
+  if (!bodyText) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return false;
+  }
+  const entries = Array.isArray(parsed) ? parsed : [parsed];
+  if (entries.length === 0) return false;
+  return entries.every((e) => {
+    const method = (e as { method?: unknown })?.method;
+    return typeof method === "string" && UNAUTHENTICATED_METHODS.has(method);
+  });
+}
 
 app.all("*", async (c) => {
   const provided = c.req.query("key") ||
     c.req.header("x-access-key") || c.req.header("x-brain-key");
-  if (!WD_ACCESS_KEY || provided !== WD_ACCESS_KEY) {
-    const bodyText = await readBodyText(c.req.raw);
+  const authenticated = Boolean(WD_ACCESS_KEY) && provided === WD_ACCESS_KEY;
+
+  // The body has to be read to see which method is being called, and a request
+  // body can only be consumed once — so it is read here and replayed into the
+  // transport below rather than passed through as a stream.
+  const bodyText = await readBodyText(c.req.raw);
+
+  if (!authenticated && !isUnauthenticatedRequest(bodyText)) {
     return unauthorizedResponse(extractJsonRpcId(bodyText));
   }
 
   // Claude Desktop connectors don't always send the Accept header that
-  // StreamableHTTPTransport requires; patch it in if missing.
-  if (!c.req.header("accept")?.includes("text/event-stream")) {
+  // StreamableHTTPTransport requires; patch it in if missing. The body is
+  // replayed here in every case, because reading it above consumed the stream.
+  {
     const headers = new Headers(c.req.raw.headers);
-    headers.set("Accept", "application/json, text/event-stream");
+    if (!headers.get("accept")?.includes("text/event-stream")) {
+      headers.set("Accept", "application/json, text/event-stream");
+    }
     const patched = new Request(c.req.raw.url, {
       method: c.req.raw.method,
       headers,
-      body: c.req.raw.body,
-      // @ts-ignore -- duplex required for streaming body in Deno
-      duplex: "half",
+      body: bodyText === null ? null : bodyText,
     });
     Object.defineProperty(c.req, "raw", { value: patched, writable: true });
   }
