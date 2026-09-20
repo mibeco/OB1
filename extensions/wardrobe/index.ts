@@ -2642,6 +2642,26 @@ app.get("*", (c) => {
 });
 
 /**
+ * Extract the access key from an `Authorization: Bearer <key>` header.
+ *
+ * Offered because the connector UI gates arbitrary custom headers (like
+ * `x-access-key`) behind an approval process, while `Authorization` is a
+ * standard header and may not be gated. If it is permitted, the key can leave
+ * the URL — query strings end up in browser history, proxy and CDN logs,
+ * Referer headers and screenshots, and headers largely do not.
+ *
+ * Parsed strictly: the scheme must be exactly `Bearer`, case-insensitively,
+ * with a single token after it. The token is then held to the same equality
+ * check as every other channel — this widens how the key may ARRIVE, never
+ * what counts as a valid key.
+ */
+function bearerToken(header: string | undefined): string | undefined {
+  if (!header) return undefined;
+  const match = /^Bearer[ ]+(\S+)$/i.exec(header.trim());
+  return match ? match[1] : undefined;
+}
+
+/**
  * JSON-RPC methods an UNAUTHENTICATED caller may invoke.
  *
  * A connector configured for "no sign-in" probes the server before it will
@@ -2747,7 +2767,8 @@ function isUnauthenticatedRequest(bodyText: string | null): boolean {
 
 app.all("*", async (c) => {
   const provided = c.req.query("key") ||
-    c.req.header("x-access-key") || c.req.header("x-brain-key");
+    c.req.header("x-access-key") || c.req.header("x-brain-key") ||
+    bearerToken(c.req.header("authorization"));
   const authenticated = Boolean(WD_ACCESS_KEY) && provided === WD_ACCESS_KEY;
 
   // The body has to be read to see which method is being called, and a request
