@@ -31,7 +31,7 @@ import { StreamableHTTPTransport } from "@hono/mcp";
 import { z } from "zod";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY");
+const WD_ACCESS_KEY = Deno.env.get("WD_ACCESS_KEY");
 
 // --- Shared helpers ------------------------------------------------------
 
@@ -2616,7 +2616,7 @@ app.use("*", async (c, next) => {
       {
         error: "not_found",
         message:
-          "This server does not use OAuth. Authenticate with the access key: append ?key=<MCP_ACCESS_KEY> to the connector URL, or send it as the x-access-key header.",
+          "This server does not use OAuth. Authenticate with the access key: append ?key=<WD_ACCESS_KEY> to the connector URL, or send it as the x-access-key header.",
       },
       404,
       corsHeaders,
@@ -2629,7 +2629,7 @@ app.use("*", async (c, next) => {
 app.get("*", (c) => {
   const provided = c.req.query("key") ||
     c.req.header("x-access-key") || c.req.header("x-brain-key");
-  if (!MCP_ACCESS_KEY || provided !== MCP_ACCESS_KEY) {
+  if (!WD_ACCESS_KEY || provided !== WD_ACCESS_KEY) {
     // Still answer GET pings without leaking auth as a transport fault.
     return c.json({ status: "ok", service: "Wardrobe System", version: "1.0.0", authenticated: false }, 200, corsHeaders);
   }
@@ -2639,7 +2639,7 @@ app.get("*", (c) => {
 app.all("*", async (c) => {
   const provided = c.req.query("key") ||
     c.req.header("x-access-key") || c.req.header("x-brain-key");
-  if (!MCP_ACCESS_KEY || provided !== MCP_ACCESS_KEY) {
+  if (!WD_ACCESS_KEY || provided !== WD_ACCESS_KEY) {
     const bodyText = await readBodyText(c.req.raw);
     return unauthorizedResponse(extractJsonRpcId(bodyText));
   }
