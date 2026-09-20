@@ -5,6 +5,7 @@ import { StreamableHTTPTransport } from "@hono/mcp";
 import { Hono } from "hono";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -631,11 +632,148 @@ function unauthorizedResponse(id: string | number | null): Response {
   });
 }
 
+// --- OAuth 2.1 resource server (dormant until configured) ----------------
+
+/**
+ * OAuth, as a resource server in front of Supabase Auth's OAuth 2.1 server.
+ *
+ * DORMANT BY DEFAULT. Nothing here runs unless all three secrets are set:
+ *
+ *   OB_PUBLIC_URL          this server's URL EXACTLY as typed into the
+ *                          connector. It is published as `resource`, and
+ *                          Claude requires the two to match to the byte.
+ *   OB_OAUTH_CLIENT_IDS    comma-separated OAuth client ids allowed to call.
+ *   OB_OAUTH_ALLOWED_SUBS  comma-separated user UUIDs allowed to call.
+ *
+ * Until then the server behaves exactly as before: shared key, 200-wrapped
+ * refusals. Unset any one of them to switch it back off.
+ *
+ * WHY THE LAST TWO ARE NOT OPTIONAL. Supabase sets `aud` to the fixed string
+ * "authenticated" on every token the project issues; it validates the RFC 8707
+ * `resource` parameter but never binds it into the token. So signature +
+ * issuer + audience — the textbook check — accepts ANY token this project has
+ * ever minted for anyone. What actually ties a token to this server is
+ * `client_id` (present only on tokens issued through the OAuth server, to that
+ * registered client) and `sub` (an explicit allowlist of owners). Use a client
+ * id of this server's own: a token issued to another function's client must
+ * not open the memory store.
+ */
+function envList(name: string): Set<string> {
+  return new Set(
+    (Deno.env.get(name) ?? "").split(",").map((v) => v.trim()).filter(Boolean),
+  );
+}
+
+const OB_PUBLIC_URL = Deno.env.get("OB_PUBLIC_URL")?.trim();
+const OB_OAUTH_CLIENT_IDS = envList("OB_OAUTH_CLIENT_IDS");
+const OB_OAUTH_ALLOWED_SUBS = envList("OB_OAUTH_ALLOWED_SUBS");
+const OAUTH_ENABLED = Boolean(
+  OB_PUBLIC_URL && OB_OAUTH_CLIENT_IDS.size && OB_OAUTH_ALLOWED_SUBS.size,
+);
+
+const OAUTH_ISSUER = `${SUPABASE_URL}/auth/v1`;
+const OAUTH_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource";
+const OAUTH_RESOURCE_METADATA_URL = `${OB_PUBLIC_URL}${OAUTH_RESOURCE_METADATA_PATH}`;
+
+// Fetched lazily and cached by jose; rotated keys are picked up on a kid miss.
+const oauthJwks = createRemoteJWKSet(
+  new URL(`${OAUTH_ISSUER}/.well-known/jwks.json`),
+);
+
+/** Strictly `Bearer <one token>`; anything else is not a bearer credential. */
+function bearerToken(header: string | undefined): string | undefined {
+  if (!header) return undefined;
+  const match = /^Bearer[ ]+(\S+)$/i.exec(header.trim());
+  return match ? match[1] : undefined;
+}
+
+/**
+ * Verify an OAuth access token. Returns the caller, or null for ANY failure —
+ * the reason is logged, never sent to the client.
+ *
+ * Asymmetric algorithms only: the project's legacy HS256 secret also signs
+ * valid-looking tokens (the database role token is one), and none of those may
+ * ever authenticate a caller here.
+ */
+async function verifyOAuthToken(
+  token: string,
+): Promise<{ sub: string; clientId: string } | null> {
+  try {
+    const { payload } = await jwtVerify(token, oauthJwks, {
+      issuer: OAUTH_ISSUER,
+      audience: "authenticated",
+      algorithms: ["ES256", "RS256"],
+    });
+    const sub = typeof payload.sub === "string" ? payload.sub : "";
+    const clientId = typeof payload.client_id === "string" ? payload.client_id : "";
+    if (!clientId || !OB_OAUTH_CLIENT_IDS.has(clientId)) {
+      console.warn(`oauth: rejected, client_id not allowed (${clientId || "none"})`);
+      return null;
+    }
+    if (!sub || !OB_OAUTH_ALLOWED_SUBS.has(sub)) {
+      console.warn(`oauth: rejected, sub not allowed (${sub || "none"})`);
+      return null;
+    }
+    return { sub, clientId };
+  } catch (e) {
+    console.warn(`oauth: rejected, ${(e as Error).message}`);
+    return null;
+  }
+}
+
+/**
+ * The OAuth refusal: a real HTTP 401 carrying `WWW-Authenticate`. Claude only
+ * starts (or refreshes) an OAuth flow on a transport-level 401 — it ignores
+ * the header on a 200 — and `resource_metadata` is how it finds the metadata
+ * on a host that cannot serve `/.well-known/*` at its root.
+ */
+function oauthChallengeResponse(
+  id: string | number | null,
+  tokenWasPresented: boolean,
+): Response {
+  const challenge = `Bearer resource_metadata="${OAUTH_RESOURCE_METADATA_URL}"` +
+    (tokenWasPresented ? `, error="invalid_token"` : "");
+  return new Response(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code: JSON_RPC_UNAUTHORIZED_CODE, message: UNAUTHORIZED_MESSAGE },
+      id,
+    }),
+    {
+      status: 401,
+      headers: {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": challenge,
+        ...corsHeaders,
+        "Access-Control-Expose-Headers": "WWW-Authenticate",
+      },
+    },
+  );
+}
+
 const app = new Hono();
 
 // CORS preflight — required for browser/Electron-based clients (Claude Desktop, claude.ai)
 app.options("*", (c) => {
   return c.text("ok", 200, corsHeaders);
+});
+
+// Protected-resource metadata. Served from a subpath because the Supabase
+// gateway owns `/.well-known/*` at the origin; the 401 challenge points here.
+app.get("*", async (c, next) => {
+  if (OAUTH_ENABLED && new URL(c.req.url).pathname.endsWith(OAUTH_RESOURCE_METADATA_PATH)) {
+    return c.json(
+      {
+        resource: OB_PUBLIC_URL,
+        authorization_servers: [OAUTH_ISSUER],
+        bearer_methods_supported: ["header"],
+        resource_name: "Open Brain",
+      },
+      200,
+      { ...corsHeaders, "Cache-Control": "no-store" },
+    );
+  }
+  await next();
 });
 
 app.all("*", async (c) => {
@@ -646,7 +784,28 @@ app.all("*", async (c) => {
   // header name. Prefer a header: query strings leak into history and logs.
   const provided = c.req.header("x-access-key") || c.req.header("x-brain-key") ||
     new URL(c.req.url).searchParams.get("key");
-  if (!provided || provided !== OB_ACCESS_KEY) {
+  let authenticated = Boolean(OB_ACCESS_KEY) && Boolean(provided) &&
+    provided === OB_ACCESS_KEY;
+
+  // OAuth is an ADDITIONAL way in: the static key keeps working until it is
+  // deliberately removed (unset OB_ACCESS_KEY).
+  const bearer = bearerToken(c.req.header("authorization"));
+  const presentedJwt = OAUTH_ENABLED && !authenticated &&
+    Boolean(bearer) && bearer!.split(".").length === 3;
+  if (presentedJwt) {
+    const caller = await verifyOAuthToken(bearer!);
+    if (caller) {
+      authenticated = true;
+      console.log(`oauth: accepted sub=${caller.sub} client=${caller.clientId}`);
+    }
+  }
+
+  if (!authenticated && OAUTH_ENABLED) {
+    const bodyText = await readBodyText(c.req.raw);
+    return oauthChallengeResponse(extractJsonRpcId(bodyText), presentedJwt);
+  }
+
+  if (!authenticated) {
     // Return a JSON-RPC 2.0 error envelope (HTTP 200) instead of a bare
     // HTTP 401 so strict MCP hosts treat this as an application-level
     // error rather than a transport fault and keep the connection alive.
