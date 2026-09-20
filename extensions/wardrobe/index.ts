@@ -2668,6 +2668,62 @@ const UNAUTHENTICATED_METHODS = new Set([
 ]);
 
 /**
+ * `tools/list` is in that set so the probe completes, but an anonymous caller
+ * gets an EMPTY catalogue, not the real one. The probe only needs a valid
+ * handshake to accept a no-sign-in connector; it has no need to read what the
+ * tools are, and publishing names, descriptions and argument schemas to anyone
+ * holding the URL was an exposure taken on under time pressure, not a decision
+ * worth keeping.
+ *
+ * It also makes a misconfigured connector fail visibly. A connector whose URL
+ * has lost its `?key=` registers, shows ZERO tools, and is obviously broken —
+ * rather than listing 21 tools and then refusing every call, which is exactly
+ * how one keyless connector got mistaken for a working one.
+ */
+function emptyToolListResponse(bodyText: string): Response {
+  const id = extractJsonRpcId(bodyText);
+  return new Response(
+    JSON.stringify({ jsonrpc: "2.0", result: { tools: [] }, id }),
+    { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } },
+  );
+}
+
+/**
+ * Classify an anonymous request: does it ask for the catalogue, and is it a
+ * batch?
+ *
+ * The batch case matters. An earlier version of this check only looked at the
+ * single-request form, so `[{"method":"tools/list"}]` fell straight through to
+ * the transport and served the real catalogue — the redaction was one JSON
+ * array away from being bypassed. An anonymous caller has no legitimate need
+ * to batch anything, so batches from one are refused outright rather than
+ * picked apart entry by entry.
+ */
+function classifyAnonymousRequest(
+  bodyText: string | null,
+): { batch: boolean; toolsList: boolean } {
+  if (!bodyText) return { batch: false, toolsList: false };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return { batch: false, toolsList: false };
+  }
+  if (Array.isArray(parsed)) {
+    return {
+      batch: true,
+      toolsList: parsed.some(
+        (e) => (e as { method?: unknown })?.method === "tools/list",
+      ),
+    };
+  }
+  return {
+    batch: false,
+    toolsList: (parsed as { method?: unknown })?.method === "tools/list",
+  };
+}
+
+/**
  * True when every method in the payload is safe for an anonymous caller. A
  * batch is only open if ALL of its entries are: one `tools/call` smuggled into
  * an otherwise-innocent batch must fail the whole request. Anything
@@ -2701,6 +2757,19 @@ app.all("*", async (c) => {
 
   if (!authenticated && !isUnauthenticatedRequest(bodyText)) {
     return unauthorizedResponse(extractJsonRpcId(bodyText));
+  }
+
+  if (!authenticated) {
+    const shape = classifyAnonymousRequest(bodyText);
+    // No anonymous batching: it exists here only as a way to wrap a
+    // catalogue read in something the single-request check didn't inspect.
+    if (shape.batch) {
+      return unauthorizedResponse(extractJsonRpcId(bodyText));
+    }
+    // Anonymous callers get a valid, empty catalogue — never the real one.
+    if (shape.toolsList) {
+      return emptyToolListResponse(bodyText!);
+    }
   }
 
   // Claude Desktop connectors don't always send the Accept header that
